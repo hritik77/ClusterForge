@@ -1,0 +1,68 @@
+syntax="proto3";
+
+package com.java.JobController;
+
+option java_multiple_files = true;
+
+service WorkerToController {
+    rpc registerNode(Node) returns (Cnf);
+    rpc heartBeat(Node) returns (Cnf);
+    rpc reportJobStatus(Job) returns (Cnf);
+}
+
+service ControllerToWorker {
+    rpc getJobStatus(Job) returns (Job);
+    rpc allocate(AllocationCommand) returns (Cnf);
+    rpc cancelAllocated(JobRef) returns (Cnf);
+}
+
+message Node{
+    optional int32 id=1;
+    string hostname=2;
+    NodeState state=3;
+    int32 cpu=4;
+    int32 mem=5;
+    string agent_endpoint = 6;
+}
+
+message JobRef {
+    int32 id=1;
+}
+
+message AllocationCommand {
+    int32 allocation_id=1; // idempotency key
+    Job job=2;
+}
+
+enum JobState {
+    PENDING=0;
+    ALLOCATED=1;
+    RUNNING=2;
+    COMPLETED=3;
+    HELD=4;
+    CANCELLED=5;
+    FAILED=6;
+}
+
+enum NodeState {
+    AVAILABLE=0;
+    NODE_ALLOCATED=1;
+    DOWN=2;
+    MAINTENANCE=3;
+}
+
+message Cnf {
+    int32 job_id = 1;
+    bool success = 2;
+    int32 node_id = 3;
+    string message = 4;
+}
+
+message Job {
+    int32 id=1;
+    string owner=2;
+    JobState state=3;
+    string description=4;
+    int32 cpuRequested=5;
+    int32 memRequested=6;
+}
