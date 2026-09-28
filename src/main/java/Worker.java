@@ -27,10 +27,49 @@ class Worker {
     static int cpu=8;
     static int mem=16;
     static String Hostname="localhost";
+    static int nodeId;
+    
+    public static class Beating implements Runnable {
+        private final WorkerToControllerGrpc.WorkerToControllerBlockingStub stub;
+        private final Node n;
+
+        public Beating(WorkerToControllerGrpc.WorkerToControllerBlockingStub stub, Node n) {
+            this.stub = stub;
+            this.n = n;
+        }
+        @Override
+        public void run() throws RuntimeException {
+            while (true) {
+                try {
+                    stub.heartBeat(n);
+                    System.out.println("Heartbeat sent");
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    System.out.println("Connection broke. Trying again after 2.5s");
+                    try {
+                        Thread.sleep(2500);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    public static void reporter(WorkerToControllerGrpc.WorkerToControllerBlockingStub stub,Job j) {
+        try {
+            Cnf status=stub.reportJobStatus(j);
+            System.out.println("Job "+j.getId()+" Status updated to "+j.getState());
+        } catch (RuntimeException e) {
+            System.out.println("Reporting Error. Status not reported");
+        }
+    }
+
     public static class ControllerToWorkerService extends ControllerToWorkerGrpc.ControllerToWorkerImplBase {
         @Override
         public void allocate(AllocationCommand request,StreamObserver<Cnf> obs) {
-            if (request.getJob().getId() <= 0) {
+            if (request.getJob().getId()<=0) {
                 obs.onNext(Cnf.newBuilder()
                     .setSuccess(false)
                     .setMessage("A valid job ID is required")
@@ -90,13 +129,13 @@ class Worker {
                             .build());
                     obs.onCompleted();
                     return;
-                }request.getId();
+                }
 
                 managed.setState(JobState.CANCELLED);
                 process=managed.process();
             }
 
-            if (process != null && process.isAlive()) {
+            if (process!=null && process.isAlive()) {
                 process.destroy(); // Sends a graceful SIGTERM on Linux.
 
                 JobMap.cancellationExecutor.schedule(() -> {
@@ -147,7 +186,7 @@ class Worker {
 
                 // Optional MVP reconciliation if process execution is tracked.
                 if (snapshot.getState()==JobState.RUNNING
-                        && process != null
+                        && process!=null
                         && !process.isAlive()) {
                     managed.setState(JobState.COMPLETED);
                     snapshot=managed.snapshot();
@@ -182,7 +221,15 @@ class Worker {
         if (!registration.getSuccess()) {
             throw new IllegalStateException("Node registration failed: "+registration.getMessage());
         }
+        nodeId=registration.getNodeId();
         System.out.println("Worker registered as node "+registration.getNodeId());
+
+        Node updated=n.toBuilder()
+                .setId(nodeId)
+                .build();  
+        Beating beater=new Beating(stub,updated);
+        Thread t=new Thread(beater);
+        t.start();
 
         server.awaitTermination();
     }

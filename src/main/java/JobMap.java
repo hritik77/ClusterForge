@@ -1,3 +1,7 @@
+/*For use at worker side 
+  JobMap --> (JobId,ManagedJob) HashMap
+  ManagedJob --> (Job,Process)
+  */
 package com.java.Worker;
 
 import com.java.JobController.Job;
@@ -11,9 +15,6 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-
-import com.java.JobController.Job;
-import com.java.JobController.JobState;
 
 public class JobMap {
 

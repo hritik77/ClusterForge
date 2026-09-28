@@ -4,14 +4,14 @@ package com.java.JobController;
 
 option java_multiple_files = true;
 
-service WorkerToController {
+service WorkerToController { //Functions to be implemented at Controller
     rpc registerNode(Node) returns (Cnf);
     rpc heartBeat(Node) returns (Cnf);
-    rpc reportJobStatus(Job) returns (Cnf);
+    rpc reportJobStatus(Job) returns (Cnf); //Worker reports Job Status to Controller
 }
 
 service ControllerToWorker {
-    rpc getJobStatus(Job) returns (Job);
+    rpc getJobStatus(Job) returns (Job); //Controller asks for job status from worker
     rpc allocate(AllocationCommand) returns (Cnf);
     rpc cancelAllocated(JobRef) returns (Cnf);
 }
