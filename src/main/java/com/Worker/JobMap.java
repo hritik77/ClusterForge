@@ -1,19 +1,12 @@
-/*For use at worker side 
-  JobMap --> (JobId,ManagedJob) HashMap
-  ManagedJob --> (Job,Process)
-  */
-package com.java.Worker;
+package com.Worker;
 
-import com.java.JobController.Job;
-import com.java.JobController.JobState;
-
-import io.grpc.Status;
-import io.grpc.stub.StreamObserver;
+import com.JobController.Job;
+import com.JobController.JobState;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 public class JobMap {
@@ -26,7 +19,7 @@ public class JobMap {
 
     static final class ManagedJob {
         private Job job;
-        private Process process; // null while queued
+        private Process process;
 
         ManagedJob(Job job) {
             this.job=job;
@@ -37,9 +30,9 @@ public class JobMap {
         }
 
         synchronized void setState(JobState state) {
-            job=job.toBuilder()
-                    .setState(state)
-                    .build();
+            if (!isTerminal(job.getState())) {
+                job=job.toBuilder().setState(state).build();
+            }
         }
 
         synchronized Process process() {
@@ -48,6 +41,11 @@ public class JobMap {
 
         synchronized void setProcess(Process process) {
             this.process=process;
+        }
+
+        private static boolean isTerminal(JobState state) {
+            return state==JobState.COMPLETED || state==JobState.FAILED
+                    || state==JobState.CANCELLED;
         }
     }
 }

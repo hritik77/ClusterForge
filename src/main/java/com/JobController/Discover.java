@@ -1,17 +1,19 @@
-package com.java.JobController;
+package com.JobController;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.stub.StreamObserver;
 
 import java.io.IOException;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 
 /** Total / available CPU and memory of one node. Thread-safe. */
 final class NodeResourceTally {
@@ -94,8 +96,21 @@ final class JobEntry {
     int allocationId()      { return allocationId; }
     long allocatedAt()      { return allocatedAt; }
 
-    void setState(JobState state) {
-        this.job=job.toBuilder().setState(state).build();
+    synchronized void setState(JobState state) {
+        if (!isTerminal(job.getState())) {
+            this.job=job.toBuilder().setState(state).build();
+        }
+    }
+
+    synchronized boolean tryCancel() {
+        if (isTerminal(job.getState())) return false;
+        this.job=job.toBuilder().setState(JobState.CANCELLED).build();
+        return true;
+    }
+
+    private static boolean isTerminal(JobState state) {
+        return state==JobState.COMPLETED || state==JobState.FAILED
+                || state==JobState.CANCELLED;
     }
 
     /** Gives CPU/mem back to the node exactly once, however many times it is called. */
@@ -106,8 +121,9 @@ final class JobEntry {
     }
 }
 
-class Discover {
+public class Discover implements RestApiServer.JobOperations {
     private static final AtomicInteger nextNodeId=new AtomicInteger();
+    private static final AtomicInteger nextJobId=new AtomicInteger();
     private static final AtomicInteger allocationKey=new AtomicInteger();
 
     private static final WorkerClientRegistry workers=new WorkerClientRegistry();
@@ -118,12 +134,117 @@ class Discover {
     // jobId -> [job, node it is allocated on, ...]
     private static final ConcurrentHashMap<Integer, JobEntry> jobs=new ConcurrentHashMap<>();
 
+    @Override
+    public Optional<Job> submitJob(String owner, String description, int cpuRequested,
+                                  int memRequested) {
+        Job job=Job.newBuilder()
+                .setId(nextJobId.incrementAndGet())
+                .setOwner(owner)
+                .setDescription(description)
+                .setCpuRequested(cpuRequested)
+                .setMemRequested(memRequested)
+                .setState(JobState.PENDING)
+                .build();
+        if (!allocater(job)) return Optional.empty();
+        return findJob(job.getId());
+    }
+
+    @Override
+    public List<Job> listJobs() {
+        return jobs.values().stream()
+                .map(JobEntry::job)
+                .sorted(Comparator.comparingInt(Job::getId))
+                .toList();
+    }
+
+    @Override
+    public Optional<Job> findJob(int id) {
+        JobEntry entry=jobs.get(id);
+        return entry==null ? Optional.empty() : Optional.of(entry.job());
+    }
+
+    @Override
+    public RestApiServer.CancellationResult cancelJob(int id) {
+        JobEntry entry=jobs.get(id);
+        if (entry==null) {
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.NOT_FOUND, null);
+        }
+
+        Job current=entry.job();
+        if (current.getState()==JobState.CANCELLED) {
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.ALREADY_CANCELLED, current);
+        }
+        if (current.getState()==JobState.COMPLETED || current.getState()==JobState.FAILED) {
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.NOT_CANCELLABLE, current);
+        }
+
+        try {
+            WorkerClientRegistry.WorkerClient client=workers.getOrConnect(
+                    entry.node().nodeId(), entry.node().node().getAgentEndpoint());
+            Cnf reply=client.stub()
+                    .withDeadlineAfter(5, TimeUnit.SECONDS)
+                    .cancelAllocated(JobRef.newBuilder().setId(id).build());
+            if (!reply.getSuccess()) {
+                return refreshCancellationState(id, entry);
+            }
+            if (!entry.tryCancel()) {
+                Job latest=entry.job();
+                RestApiServer.CancellationOutcome outcome =
+                        latest.getState()==JobState.CANCELLED
+                                ? RestApiServer.CancellationOutcome.ALREADY_CANCELLED
+                                : latest.getState()==JobState.COMPLETED
+                                        || latest.getState()==JobState.FAILED
+                                        ? RestApiServer.CancellationOutcome.NOT_CANCELLABLE
+                                        : RestApiServer.CancellationOutcome.UNAVAILABLE;
+                return new RestApiServer.CancellationResult(outcome, latest);
+            }
+            entry.releaseResources();
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.CANCELLED, entry.job());
+        } catch (RuntimeException e) {
+            System.out.println("Cancel failed: " + e.getMessage());
+            return refreshCancellationState(id, entry);
+        }
+    }
+
+    private static RestApiServer.CancellationResult refreshCancellationState(int id, JobEntry entry) {
+        try {
+            WorkerClientRegistry.WorkerClient client=workers.getOrConnect(
+                    entry.node().nodeId(), entry.node().node().getAgentEndpoint());
+            Job workerJob=client.stub()
+                    .withDeadlineAfter(5, TimeUnit.SECONDS)
+                    .getJobStatus(Job.newBuilder().setId(id).build());
+            JobState workerState=workerJob.getState();
+            if (workerState==JobState.CANCELLED || workerState==JobState.COMPLETED
+                    || workerState==JobState.FAILED) {
+                entry.setState(workerState);
+                entry.releaseResources();
+            }
+        } catch (RuntimeException e) {
+            System.out.println("Could not refresh job state after cancellation failure: "
+                    + e.getMessage());
+        }
+
+        Job current=entry.job();
+        RestApiServer.CancellationOutcome outcome =
+                current.getState()==JobState.CANCELLED
+                        ? RestApiServer.CancellationOutcome.ALREADY_CANCELLED
+                        : current.getState()==JobState.COMPLETED
+                                || current.getState()==JobState.FAILED
+                                ? RestApiServer.CancellationOutcome.NOT_CANCELLABLE
+                                : RestApiServer.CancellationOutcome.UNAVAILABLE;
+        return new RestApiServer.CancellationResult(outcome, current);
+    }
+
     private static Cnf fail(String message) {
         return Cnf.newBuilder().setSuccess(false).setMessage(message).build();
     }
 
-    private static final long HEARTBEAT_INTERVAL_MS=5_000;               // what the worker uses
-    private static final long HEARTBEAT_TIMEOUT_NS =3 * HEARTBEAT_INTERVAL_MS * 1_000_000L; // 15 s
+    private static final long HEARTBEAT_INTERVAL_MS=5_000;
+    private static final long HEARTBEAT_TIMEOUT_NS=3 * HEARTBEAT_INTERVAL_MS * 1_000_000L;
 
     private static final ScheduledExecutorService reaper =
             Executors.newSingleThreadScheduledExecutor();
@@ -232,7 +353,8 @@ class Discover {
 
     /** Picks a node with enough free CPU/mem, reserves it, and tells the worker. */
     public static boolean allocater(Job j) {
-        if (j.getId()<=0 || jobs.containsKey(j.getId())) {
+        if (j.getId()<=0 || j.getCpuRequested()<=0 || j.getMemRequested()<=0
+                || jobs.containsKey(j.getId())) {
             System.out.println("Job Allocation Unsuccessful: invalid or duplicate job id");
             return false;
         }
@@ -282,41 +404,32 @@ class Discover {
     }
 
     public static boolean canceller(Job j) {
-        JobEntry entry=jobs.get(j.getId());
-        if (entry==null) {
-            System.out.println("Cancel failed: job " + j.getId() + " is not allocated");
-            return false;
-        }
-        try {
-            WorkerClientRegistry.WorkerClient client=workers.getOrConnect(
-                    entry.node().nodeId(), entry.node().node().getAgentEndpoint());
-            Cnf reply=client.stub()
-                    .withDeadlineAfter(5, TimeUnit.SECONDS)
-                    .cancelAllocated(JobRef.newBuilder().setId(j.getId()).build());
-            if (reply.getSuccess()) {
-                entry.setState(JobState.CANCELLED);
-                entry.releaseResources();
-            }
-            return reply.getSuccess();
-        } catch (RuntimeException e) {
-            System.out.println("Cancel failed: " + e.getMessage());
-            return false;
-        }
+        RestApiServer.CancellationOutcome outcome=new Discover()
+                .cancelJob(j.getId()).outcome();
+        return outcome==RestApiServer.CancellationOutcome.CANCELLED
+                || outcome==RestApiServer.CancellationOutcome.ALREADY_CANCELLED;
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
-        Server server=ServerBuilder.forPort(9999)
+        int grpcPort=Integer.getInteger("clusterforge.controller.port", 9999);
+        Server server=ServerBuilder.forPort(grpcPort)
                 .addService(new NodeManager())
                 .build();
+        String restHost=System.getProperty("clusterforge.rest.host", "127.0.0.1");
+        int restPort=Integer.getInteger("clusterforge.rest.port", 8080);
+        RestApiServer restServer=new RestApiServer(restHost, restPort, new Discover());
         startFailureDetector();
         System.out.println("Reaper Started");
         server.start();
-        Runtime.getRuntime().addShutdownHook(new Thread(workers::close));
-        System.out.println("Broker started on port 9999");
-        server.awaitTermination();
+        restServer.start();
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            restServer.close();
+            server.shutdown();
             reaper.shutdownNow();
             workers.close();
         }));
+        System.out.println("Controller gRPC started on port " + grpcPort);
+        System.out.println("REST API started on " + restHost + ":" + restServer.port());
+        server.awaitTermination();
     }
 }

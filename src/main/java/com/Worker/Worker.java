@@ -1,15 +1,15 @@
-package com.java.Worker;
+package com.Worker;
 
-import com.java.JobController.AllocationCommand;
-import com.java.JobController.JobRef;   
-import com.java.JobController.Job;
-import com.java.JobController.Cnf;
-import com.java.JobController.JobState;
-import com.java.JobController.Node;
-import com.java.JobController.NodeState;
+import com.JobController.AllocationCommand;
+import com.JobController.JobRef;
+import com.JobController.Job;
+import com.JobController.Cnf;
+import com.JobController.JobState;
+import com.JobController.Node;
+import com.JobController.NodeState;
 
-import com.java.JobController.ControllerToWorkerGrpc;
-import com.java.JobController.WorkerToControllerGrpc;
+import com.JobController.ControllerToWorkerGrpc;
+import com.JobController.WorkerToControllerGrpc;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -17,16 +17,18 @@ import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.stub.StreamObserver;
 import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 
-import java.util.concurrent.TimeUnit;
 import java.io.IOException;
-import java.util.ArrayDeque;
-import java.util.Queue;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
-class Worker {
-    static int cpu=8;
-    static int mem=16;
-    static String Hostname="localhost";
+public class Worker {
+    private static final Logger LOGGER=Logger.getLogger(Worker.class.getName());
+    static int cpu=Integer.getInteger("clusterforge.worker.cpu", 8);
+    static int mem=Integer.getInteger("clusterforge.worker.mem", 16);
+    static String Hostname=System.getProperty("clusterforge.worker.hostname", "localhost");
     static int nodeId;
     
     public static class Beating implements Runnable {
@@ -38,17 +40,19 @@ class Worker {
             this.n = n;
         }
         @Override
-        public void run() throws RuntimeException {
-            while (true) {
+        public void run() {
+            while (!Thread.currentThread().isInterrupted()) {
                 try {
-                    stub.heartBeat(n);
-                    System.out.println("Heartbeat sent");
+                    stub.withDeadlineAfter(5, TimeUnit.SECONDS).heartBeat(n);
                     Thread.sleep(5000);
                 } catch (InterruptedException e) {
-                    System.out.println("Connection broke. Trying again after 2.5s");
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (StatusRuntimeException e) {
+                    LOGGER.log(Level.WARNING, "Heartbeat failed; retrying in 2.5 seconds", e);
                     try {
                         Thread.sleep(2500);
-                    } catch (InterruptedException ignored) {
+                    } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
                         return;
                     }
@@ -59,14 +63,22 @@ class Worker {
 
     public static void reporter(WorkerToControllerGrpc.WorkerToControllerBlockingStub stub,Job j) {
         try {
-            Cnf status=stub.reportJobStatus(j);
-            System.out.println("Job "+j.getId()+" Status updated to "+j.getState());
+            stub.withDeadlineAfter(5, TimeUnit.SECONDS).reportJobStatus(j);
+            LOGGER.info(() -> "Reported job " + j.getId() + " as " + j.getState());
         } catch (RuntimeException e) {
-            System.out.println("Reporting Error. Status not reported");
+            LOGGER.log(Level.SEVERE, "Could not report status for job " + j.getId(), e);
         }
     }
 
-    public static class ControllerToWorkerService extends ControllerToWorkerGrpc.ControllerToWorkerImplBase {
+    public static class ControllerToWorkerService
+            extends ControllerToWorkerGrpc.ControllerToWorkerImplBase {
+        private final WorkerToControllerGrpc.WorkerToControllerBlockingStub controllerStub;
+
+        ControllerToWorkerService(
+                WorkerToControllerGrpc.WorkerToControllerBlockingStub controllerStub) {
+            this.controllerStub=controllerStub;
+        }
+
         @Override
         public void allocate(AllocationCommand request,StreamObserver<Cnf> obs) {
             if (request.getJob().getId()<=0) {
@@ -81,7 +93,8 @@ class Worker {
             Job allocatedJob=job.toBuilder()
                             .setState(JobState.ALLOCATED)
                             .build();
-            JobMap.ManagedJob previous=JobMap.jobs.putIfAbsent(allocatedJob.getId(),new JobMap.ManagedJob(allocatedJob));
+            JobMap.ManagedJob previous=JobMap.jobs.putIfAbsent(
+                    allocatedJob.getId(), new JobMap.ManagedJob(allocatedJob));
             obs.onNext(Cnf.newBuilder()
                     .setSuccess(previous==null || previous.snapshot().equals(allocatedJob))
                     .setJobId(allocatedJob.getId())
@@ -123,7 +136,7 @@ class Worker {
                 // Do not turn a completed/failed job into CANCELLED.
                 if (current==JobState.COMPLETED || current==JobState.FAILED) {
                     obs.onNext(Cnf.newBuilder()
-                            .setSuccess(true)
+                            .setSuccess(false)
                             .setJobId(jobId)
                             .setMessage("Job has already finished")
                             .build());
@@ -140,22 +153,13 @@ class Worker {
 
                 JobMap.cancellationExecutor.schedule(() -> {
                     if (process.isAlive()) {
-                        process.destroyForcibly(); // SIGKILL fallback for MVP.
+                        process.destroyForcibly();
                     }
                 }, 10, TimeUnit.SECONDS);
 
-                /*
-                * Beyond MVP:
-                * - Stop the workload's systemd scope or cgroup, not merely its parent PID.
-                * - Kill every child process in the job's process tree.
-                * - Close job network/storage mounts and clean temporary directories.
-                * - Capture cancellation reason and final resource usage.
-                */
             }
 
-            // Beyond MVP: call WorkerToController.ReportJobStatus here.
-            // Discover should mark the allocation cancelled and release cluster capacity.
-            // Local CPU/memory reservation should be released here as well.
+            reporter(controllerStub, managed.snapshot());
 
             obs.onNext(Cnf.newBuilder()
                     .setSuccess(true)
@@ -173,7 +177,7 @@ class Worker {
             if (managed==null) {
                 obs.onError(
                         Status.NOT_FOUND
-                                .withDescription("Job "+jobId+" is not on this worker")
+                                .withDescription("Job " + jobId + " is not on this worker")
                                 .asRuntimeException()
                 );
                 return;
@@ -184,7 +188,7 @@ class Worker {
                 snapshot=managed.snapshot();
                 Process process=managed.process();
 
-                // Optional MVP reconciliation if process execution is tracked.
+                // Reconcile a tracked process that ended before its final status was reported.
                 if (snapshot.getState()==JobState.RUNNING
                         && process!=null
                         && !process.isAlive()) {
@@ -198,39 +202,61 @@ class Worker {
         }
     }
 
-    public static void main(String args[]) throws IOException,InterruptedException {
-        Server server=ServerBuilder.forPort(9000)
-                                .addService(new ControllerToWorkerService())
-                                .build();
-        server.start();
-        System.out.println("Worker Server Started at port 9000");
+    public static void main(String[] args) throws IOException, InterruptedException {
+        int workerPort=Integer.getInteger("clusterforge.worker.port", 9000);
+        String workerHost=System.getProperty("clusterforge.worker.host", "localhost");
+        String controllerHost=System.getProperty("clusterforge.controller.host", "localhost");
+        int controllerPort=Integer.getInteger("clusterforge.controller.port", 9999);
+        if (cpu<=0 || mem<=0) {
+            throw new IllegalArgumentException("Worker CPU and memory capacity must be positive");
+        }
+        ManagedChannel controllerChannel=ManagedChannelBuilder
+                .forAddress(controllerHost, controllerPort)
+                .usePlaintext()
+                .build();
+        WorkerToControllerGrpc.WorkerToControllerBlockingStub stub =
+                WorkerToControllerGrpc.newBlockingStub(controllerChannel);
+        Server server=ServerBuilder.forPort(workerPort)
+                .addService(new ControllerToWorkerService(stub))
+                .build();
+        Thread heartbeatThread=null;
+        try {
+            server.start();
+            System.out.println("Worker server started on port " + workerPort);
 
-        //Register Node
-        ManagedChannel controllerChannel=ManagedChannelBuilder.forAddress("localhost",9999)
-                                                .usePlaintext()
-                                                .build();
-        WorkerToControllerGrpc.WorkerToControllerBlockingStub stub=WorkerToControllerGrpc.newBlockingStub(controllerChannel);
-        Node n=Node.newBuilder()
+            Node node=Node.newBuilder()
                     .setHostname(Hostname)
                     .setState(NodeState.AVAILABLE)
                     .setCpu(cpu)
                     .setMem(mem)
-                    .setAgentEndpoint("localhost:9000")
+                    .setAgentEndpoint(workerHost + ":" + workerPort)
                     .build();
-        Cnf registration=stub.registerNode(n);
-        if (!registration.getSuccess()) {
-            throw new IllegalStateException("Node registration failed: "+registration.getMessage());
+            Cnf registration=stub.registerNode(node);
+            if (!registration.getSuccess()) {
+                throw new IllegalStateException(
+                        "Node registration failed: " + registration.getMessage());
+            }
+            nodeId=registration.getNodeId();
+            System.out.println("Worker registered as node " + nodeId);
+
+            Node registeredNode=node.toBuilder().setId(nodeId).build();
+            heartbeatThread=new Thread(new Beating(stub, registeredNode), "worker-heartbeat");
+            heartbeatThread.setDaemon(true);
+            heartbeatThread.start();
+
+            Thread finalHeartbeatThread=heartbeatThread;
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                finalHeartbeatThread.interrupt();
+                server.shutdown();
+                controllerChannel.shutdown();
+                JobMap.cancellationExecutor.shutdownNow();
+            }, "worker-shutdown"));
+            server.awaitTermination();
+        } finally {
+            if (heartbeatThread!=null) heartbeatThread.interrupt();
+            server.shutdownNow();
+            controllerChannel.shutdownNow();
+            JobMap.cancellationExecutor.shutdownNow();
         }
-        nodeId=registration.getNodeId();
-        System.out.println("Worker registered as node "+registration.getNodeId());
-
-        Node updated=n.toBuilder()
-                .setId(nodeId)
-                .build();  
-        Beating beater=new Beating(stub,updated);
-        Thread t=new Thread(beater);
-        t.start();
-
-        server.awaitTermination();
     }
 }

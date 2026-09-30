@@ -1,12 +1,4 @@
-/* For Use at Job Controller Side
-  Registry --> (ID,WorkerClient) HashMap4
-  WorkerClient --> (endpoint,channel,stub) 
-  remove(ID) --> remove entry from registry
-  getOrConnect(ID,endpoint) --> Create and register new WorkerClient in the regisry
-  close() --> Close all channels
-  */
-
-package com.java.JobController;
+package com.JobController;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -26,7 +18,7 @@ public final class WorkerClientRegistry implements AutoCloseable {
             }
 
             if (existing!=null) {
-                existing.channel().shutdown();
+                existing.channel().shutdownNow();
             }
 
             ManagedChannel channel=ManagedChannelBuilder
@@ -46,14 +38,13 @@ public final class WorkerClientRegistry implements AutoCloseable {
         WorkerClient client=clients.remove(nodeId);
 
         if (client!=null) {
-            client.channel().shutdown();
+            client.channel().shutdownNow();
         }
     }
 
     @Override
     public void close() {
-        clients.values()
-                .forEach(client -> client.channel().shutdown());
+        clients.values().forEach(client -> client.channel().shutdownNow());
 
         clients.clear();
     }
