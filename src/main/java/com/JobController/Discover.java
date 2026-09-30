@@ -80,15 +80,14 @@ final class NodeEntry {
 /** Map value #2: jobId -> job details + the node it is allocated on */
 final class JobEntry {
     private volatile Job job;
-    private final NodeEntry node;          // live reference to the hosting node
-    private final int allocationId;
+    private volatile NodeEntry node;
+    private volatile int allocationId;
+    private boolean dispatching;
     private final long allocatedAt=System.currentTimeMillis();
     private final AtomicBoolean resourcesReleased=new AtomicBoolean(false);
 
-    JobEntry(Job job, NodeEntry node, int allocationId) {
+    JobEntry(Job job) {
         this.job=job;
-        this.node=node;
-        this.allocationId=allocationId;
     }
 
     Job job()               { return job; }
@@ -96,10 +95,48 @@ final class JobEntry {
     int allocationId()      { return allocationId; }
     long allocatedAt()      { return allocatedAt; }
 
-    synchronized void setState(JobState state) {
+    synchronized boolean setState(JobState state) {
         if (!isTerminal(job.getState())) {
             this.job=job.toBuilder().setState(state).build();
+            return true;
         }
+        return false;
+    }
+
+    synchronized boolean beginAllocation() {
+        if (job.getState()!=JobState.PENDING || node!=null || dispatching) return false;
+        dispatching=true;
+        return true;
+    }
+
+    synchronized void finishAllocation(NodeEntry node, int allocationId, boolean successful) {
+        if (successful) {
+            this.node=node;
+            this.allocationId=allocationId;
+            if (job.getState()==JobState.PENDING) {
+                job=job.toBuilder().setState(JobState.ALLOCATED).build();
+            }
+        } else if (job.getState()==JobState.PENDING) {
+            job=job.toBuilder().setState(JobState.FAILED).build();
+        }
+        dispatching=false;
+        notifyAll();
+    }
+
+    synchronized boolean awaitAllocation(long timeoutMillis) throws InterruptedException {
+        long deadline=System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        while (dispatching) {
+            long remainingNanos=deadline-System.nanoTime();
+            if (remainingNanos<=0) return false;
+            TimeUnit.NANOSECONDS.timedWait(this, remainingNanos);
+        }
+        return true;
+    }
+
+    synchronized boolean cancelIfQueued() {
+        if (job.getState()!=JobState.PENDING || node!=null || dispatching) return false;
+        job=job.toBuilder().setState(JobState.CANCELLED).build();
+        return true;
     }
 
     synchronized boolean tryCancel() {
@@ -115,52 +152,40 @@ final class JobEntry {
 
     /** Gives CPU/mem back to the node exactly once, however many times it is called. */
     void releaseResources() {
-        if (resourcesReleased.compareAndSet(false, true)) {
-            node.tally().release(job.getCpuRequested(), job.getMemRequested());
+        NodeEntry allocatedNode=node;
+        if (allocatedNode!=null && resourcesReleased.compareAndSet(false, true)) {
+            allocatedNode.tally().release(job.getCpuRequested(), job.getMemRequested());
         }
     }
 }
 
 public class Discover implements RestApiServer.JobOperations {
     private static final AtomicInteger nextNodeId=new AtomicInteger();
-    private static final AtomicInteger nextJobId=new AtomicInteger();
-    private static final AtomicInteger allocationKey=new AtomicInteger();
-
-    private static final WorkerClientRegistry workers=new WorkerClientRegistry();
+    static final AtomicInteger nextJobId=new AtomicInteger();
+    static final AtomicInteger allocationKey=new AtomicInteger();
+    static final WorkerClientRegistry workers=new WorkerClientRegistry();
+    static final JobManager jobManager=new JobManager(new LeastLoadedSchedular());
 
     // nodeId -> [node, nodeResourceTally, lastHeartBeat]
-    private static final ConcurrentHashMap<Integer, NodeEntry> nodes=new ConcurrentHashMap<>();
+    static final ConcurrentHashMap<Integer, NodeEntry> nodes=new ConcurrentHashMap<>();
 
     // jobId -> [job, node it is allocated on, ...]
-    private static final ConcurrentHashMap<Integer, JobEntry> jobs=new ConcurrentHashMap<>();
+    static final ConcurrentHashMap<Integer, JobEntry> jobs=new ConcurrentHashMap<>();
 
     @Override
     public Optional<Job> submitJob(String owner, String description, int cpuRequested,
                                   int memRequested) {
-        Job job=Job.newBuilder()
-                .setId(nextJobId.incrementAndGet())
-                .setOwner(owner)
-                .setDescription(description)
-                .setCpuRequested(cpuRequested)
-                .setMemRequested(memRequested)
-                .setState(JobState.PENDING)
-                .build();
-        if (!allocater(job)) return Optional.empty();
-        return findJob(job.getId());
+        return jobManager.submitJob(owner, description, cpuRequested, memRequested);
     }
 
     @Override
     public List<Job> listJobs() {
-        return jobs.values().stream()
-                .map(JobEntry::job)
-                .sorted(Comparator.comparingInt(Job::getId))
-                .toList();
+        return jobManager.listJobs();
     }
 
     @Override
     public Optional<Job> findJob(int id) {
-        JobEntry entry=jobs.get(id);
-        return entry==null ? Optional.empty() : Optional.of(entry.job());
+        return jobManager.findJob(id);
     }
 
     @Override
@@ -169,6 +194,17 @@ public class Discover implements RestApiServer.JobOperations {
         if (entry==null) {
             return new RestApiServer.CancellationResult(
                     RestApiServer.CancellationOutcome.NOT_FOUND, null);
+        }
+
+        try {
+            if (!entry.awaitAllocation(5_500)) {
+                return new RestApiServer.CancellationResult(
+                        RestApiServer.CancellationOutcome.UNAVAILABLE, entry.job());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.UNAVAILABLE, entry.job());
         }
 
         Job current=entry.job();
@@ -181,6 +217,17 @@ public class Discover implements RestApiServer.JobOperations {
                     RestApiServer.CancellationOutcome.NOT_CANCELLABLE, current);
         }
 
+        if (entry.cancelIfQueued()) {
+            jobManager.removeQueuedJob(id);
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.CANCELLED, entry.job());
+        }
+
+        if (entry.node()==null) {
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.UNAVAILABLE, entry.job());
+        }
+
         try {
             WorkerClientRegistry.WorkerClient client=workers.getOrConnect(
                     entry.node().nodeId(), entry.node().node().getAgentEndpoint());
@@ -188,10 +235,14 @@ public class Discover implements RestApiServer.JobOperations {
                     .withDeadlineAfter(5, TimeUnit.SECONDS)
                     .cancelAllocated(JobRef.newBuilder().setId(id).build());
             if (!reply.getSuccess()) {
+                System.err.println("Worker rejected cancellation for job " + id + ": "
+                        + reply.getMessage());
                 return refreshCancellationState(id, entry);
             }
             if (!entry.tryCancel()) {
                 Job latest=entry.job();
+                System.err.println("Job " + id + " changed state during cancellation to "
+                        + latest.getState());
                 RestApiServer.CancellationOutcome outcome =
                         latest.getState()==JobState.CANCELLED
                                 ? RestApiServer.CancellationOutcome.ALREADY_CANCELLED
@@ -202,10 +253,11 @@ public class Discover implements RestApiServer.JobOperations {
                 return new RestApiServer.CancellationResult(outcome, latest);
             }
             entry.releaseResources();
+            dispatchQueuedJobs();
             return new RestApiServer.CancellationResult(
                     RestApiServer.CancellationOutcome.CANCELLED, entry.job());
         } catch (RuntimeException e) {
-            System.out.println("Cancel failed: " + e.getMessage());
+            System.err.println("Cancel failed for job " + id + ": " + e.getMessage());
             return refreshCancellationState(id, entry);
         }
     }
@@ -224,7 +276,7 @@ public class Discover implements RestApiServer.JobOperations {
                 entry.releaseResources();
             }
         } catch (RuntimeException e) {
-            System.out.println("Could not refresh job state after cancellation failure: "
+            System.err.println("Could not refresh job state after cancellation failure: "
                     + e.getMessage());
         }
 
@@ -249,6 +301,10 @@ public class Discover implements RestApiServer.JobOperations {
     private static final ScheduledExecutorService reaper =
             Executors.newSingleThreadScheduledExecutor();
 
+    static void dispatchQueuedJobs() {
+        jobManager.dispatchQueuedJobs();
+    }
+
     static void startFailureDetector() {
         reaper.scheduleWithFixedDelay(() -> {
             try {
@@ -259,6 +315,7 @@ public class Discover implements RestApiServer.JobOperations {
                         markNodeDown(n);
                     }
                 }
+                dispatchQueuedJobs();
             } catch (RuntimeException e) {
                 e.printStackTrace();   // an uncaught exception would silently cancel future runs
             }
@@ -275,6 +332,7 @@ public class Discover implements RestApiServer.JobOperations {
                if (s!=JobState.COMPLETED && s!=JobState.FAILED && s!=JobState.CANCELLED) {
                    e.setState(JobState.FAILED);   // or reset to PENDING and reallocate
                    e.releaseResources();
+                   dispatchQueuedJobs();
                }
            }
        }
@@ -303,6 +361,7 @@ public class Discover implements RestApiServer.JobOperations {
                 // Published only after the connection succeeded, so no half-registered nodes are visible.
                 nodes.put(nodeId, new NodeEntry(node,
                         new NodeResourceTally(nodeId, node.getCpu(), node.getMem())));
+                dispatchQueuedJobs();
                 obs.onNext(Cnf.newBuilder().setSuccess(true).setNodeId(nodeId).build());
                 System.out.println("Node " + nodeId + " added");
             } catch (RuntimeException e) {
@@ -337,7 +396,10 @@ public class Discover implements RestApiServer.JobOperations {
 
             entry.setState(j.getState());
             switch (j.getState()) {
-                case COMPLETED, FAILED, CANCELLED -> entry.releaseResources();
+                case COMPLETED, FAILED, CANCELLED -> {
+                    entry.releaseResources();
+                    dispatchQueuedJobs();
+                }
                 default -> { }
             }
 
@@ -348,58 +410,6 @@ public class Discover implements RestApiServer.JobOperations {
                     .setMessage("Successfully Updated Job Status")
                     .build());
             obs.onCompleted();
-        }
-    }
-
-    /** Picks a node with enough free CPU/mem, reserves it, and tells the worker. */
-    public static boolean allocater(Job j) {
-        if (j.getId()<=0 || j.getCpuRequested()<=0 || j.getMemRequested()<=0
-                || jobs.containsKey(j.getId())) {
-            System.out.println("Job Allocation Unsuccessful: invalid or duplicate job id");
-            return false;
-        }
-
-        // 1. Find a node and reserve resources on it atomically.
-        NodeEntry chosen=null;
-        for (NodeEntry n : nodes.values()) {
-            NodeState s=n.node().getState();
-            if (s==NodeState.DOWN || s==NodeState.MAINTENANCE) continue;
-            if (n.tally().tryReserve(j.getCpuRequested(), j.getMemRequested())) {
-                chosen=n;
-                break;
-            }
-        }
-        if (chosen==null) {
-            System.out.println("Job Allocation Unsuccessful: no node has enough capacity");
-            return false;
-        }
-
-        // 2. Record the job, then call the worker.
-        int id=allocationKey.incrementAndGet();
-        Job allocated=j.toBuilder().setState(JobState.ALLOCATED).build();
-        JobEntry entry=new JobEntry(allocated, chosen, id);
-        if (jobs.putIfAbsent(j.getId(), entry)!=null) {
-            entry.releaseResources();
-            return false;
-        }
-
-        try {
-            WorkerClientRegistry.WorkerClient client =
-                    workers.getOrConnect(chosen.nodeId(), chosen.node().getAgentEndpoint());
-            Cnf reply=client.stub()
-                    .withDeadlineAfter(5, TimeUnit.SECONDS)
-                    .allocate(AllocationCommand.newBuilder()
-                            .setAllocationId(id)
-                            .setJob(allocated)
-                            .build());
-            if (!reply.getSuccess()) throw new RuntimeException(reply.getMessage());
-            System.out.println("Job " + j.getId() + " allocated to node " + chosen.nodeId());
-            return true;
-        } catch (RuntimeException e) {
-            jobs.remove(j.getId());
-            entry.releaseResources();
-            System.out.println("Job Allocation Unsuccessful: " + e.getMessage());
-            return false;
         }
     }
 
@@ -426,6 +436,7 @@ public class Discover implements RestApiServer.JobOperations {
             restServer.close();
             server.shutdown();
             reaper.shutdownNow();
+            jobManager.shutdown();
             workers.close();
         }));
         System.out.println("Controller gRPC started on port " + grpcPort);

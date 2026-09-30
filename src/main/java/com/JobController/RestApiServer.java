@@ -148,10 +148,10 @@ final class RestApiServer implements AutoCloseable {
         Optional<Job> submitted=jobs.submitJob(input.getOwner(), input.getDescription(),
                 input.getCpuRequested(), input.getMemRequested());
         if (submitted.isEmpty()) {
-            sendError(exchange, 503, "No worker is currently able to accept this job");
+            sendError(exchange, 503, "Job queue is full; the job was not accepted");
             return;
         }
-        sendJob(exchange, 201, submitted.get());
+        sendJob(exchange, 202, submitted.get());
     }
 
     private static void getJob(HttpExchange exchange, JobOperations jobs, int id) throws IOException {
@@ -185,7 +185,7 @@ final class RestApiServer implements AutoCloseable {
 
     private static void sendJob(HttpExchange exchange, int status, Job job) throws IOException {
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-        if (status==201) {
+        if (status==201 || status==202) {
             exchange.getResponseHeaders().set("Location", "/api/jobs/" + job.getId());
         }
         send(exchange, status, jsonJob(job));

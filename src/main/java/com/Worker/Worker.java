@@ -72,13 +72,6 @@ public class Worker {
 
     public static class ControllerToWorkerService
             extends ControllerToWorkerGrpc.ControllerToWorkerImplBase {
-        private final WorkerToControllerGrpc.WorkerToControllerBlockingStub controllerStub;
-
-        ControllerToWorkerService(
-                WorkerToControllerGrpc.WorkerToControllerBlockingStub controllerStub) {
-            this.controllerStub=controllerStub;
-        }
-
         @Override
         public void allocate(AllocationCommand request,StreamObserver<Cnf> obs) {
             if (request.getJob().getId()<=0) {
@@ -95,6 +88,7 @@ public class Worker {
                             .build();
             JobMap.ManagedJob previous=JobMap.jobs.putIfAbsent(
                     allocatedJob.getId(), new JobMap.ManagedJob(allocatedJob));
+            LOGGER.info(() -> "Received allocation for job " + allocatedJob.getId());
             obs.onNext(Cnf.newBuilder()
                     .setSuccess(previous==null || previous.snapshot().equals(allocatedJob))
                     .setJobId(allocatedJob.getId())
@@ -109,6 +103,7 @@ public class Worker {
             JobMap.ManagedJob managed=JobMap.jobs.get(jobId);
 
             if (managed==null) {
+                LOGGER.warning(() -> "Cancellation requested for unknown job " + jobId);
                 obs.onNext(Cnf.newBuilder()
                         .setSuccess(false)
                         .setJobId(jobId)
@@ -135,6 +130,8 @@ public class Worker {
 
                 // Do not turn a completed/failed job into CANCELLED.
                 if (current==JobState.COMPLETED || current==JobState.FAILED) {
+                    LOGGER.info(() -> "Cancellation rejected for terminal job " + jobId
+                            + " in state " + current);
                     obs.onNext(Cnf.newBuilder()
                             .setSuccess(false)
                             .setJobId(jobId)
@@ -159,13 +156,12 @@ public class Worker {
 
             }
 
-            reporter(controllerStub, managed.snapshot());
-
             obs.onNext(Cnf.newBuilder()
                     .setSuccess(true)
                     .setJobId(jobId)
                     .setMessage("Cancellation accepted")
                     .build());
+            LOGGER.info(() -> "Cancellation accepted for job " + jobId);
             obs.onCompleted();
         }
 
@@ -205,7 +201,8 @@ public class Worker {
     public static void main(String[] args) throws IOException, InterruptedException {
         int workerPort=Integer.getInteger("clusterforge.worker.port", 9000);
         String workerHost=System.getProperty("clusterforge.worker.host", "localhost");
-        String controllerHost=System.getProperty("clusterforge.controller.host", "localhost");
+        String controllerHost=System.getProperty(
+                "clusterforge.controller.host", "35.200.151.242");
         int controllerPort=Integer.getInteger("clusterforge.controller.port", 9999);
         if (cpu<=0 || mem<=0) {
             throw new IllegalArgumentException("Worker CPU and memory capacity must be positive");
@@ -217,7 +214,7 @@ public class Worker {
         WorkerToControllerGrpc.WorkerToControllerBlockingStub stub =
                 WorkerToControllerGrpc.newBlockingStub(controllerChannel);
         Server server=ServerBuilder.forPort(workerPort)
-                .addService(new ControllerToWorkerService(stub))
+                .addService(new ControllerToWorkerService())
                 .build();
         Thread heartbeatThread=null;
         try {
