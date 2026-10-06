@@ -1,17 +1,22 @@
 package com.JobController;
 
+import com.JobController.dag.DAGGraphPrinter;
+
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-final class JobManager {
+final class JobManager implements JobSubmissionService {
     private final Scheduler scheduler;
     private final Scheduler firstFitScheduler=new FirstFitSchedular();
     private final Scheduler bestFitScheduler=new BestFitSchedular();
     private final Scheduler roundRobinScheduler=new RoundRobinSchedular();
+    private final CopyOnWriteArrayList<JobEventListener> jobEventListeners =
+            new CopyOnWriteArrayList<>();
     private final JobQ jobQueue;
     private final ScheduledExecutorService dispatcher=Executors.newSingleThreadScheduledExecutor(
             runnable -> {
@@ -27,11 +32,71 @@ final class JobManager {
 
     Optional<Job> submitJob(String owner, String description, int cpuRequested, int memRequested) {
         Job job=Job.newBuilder()
-                .setId(Discover.nextJobId.incrementAndGet())
                 .setOwner(owner)
                 .setDescription(description)
                 .setCpuRequested(cpuRequested)
                 .setMemRequested(memRequested)
+                .setState(JobState.PENDING)
+                .build();
+        return enqueueJob(job, true);
+    }
+
+    @Override
+    public long submit(Job job) {
+        if (job == null) {
+            throw new IllegalArgumentException("Job must not be null");
+        }
+        if (job.getId() != 0 || job.getState() != JobState.PENDING) {
+            throw new IllegalArgumentException("Job ID and state must be assigned by the controller");
+        }
+        if (job.getOwner().isBlank() || job.getDescription().isBlank()) {
+            throw new IllegalArgumentException("Job owner and description are required");
+        }
+        if (job.getCpuRequested() <= 0 || job.getMemRequested() <= 0) {
+            throw new IllegalArgumentException("Job CPU and memory requests must be positive");
+        }
+
+        return enqueueJob(job).map(Job::getId)
+                .orElseThrow(() -> new IllegalStateException("Job queue is full"));
+    }
+
+    void addJobEventListener(JobEventListener listener) {
+        if (listener == null) {
+            throw new IllegalArgumentException("Job event listener must not be null");
+        }
+        jobEventListeners.addIfAbsent(listener);
+    }
+
+    void publishTerminalJobEvent(Job job) {
+        if (job == null) {
+            throw new IllegalArgumentException("Job must not be null");
+        }
+
+        for (JobEventListener listener : jobEventListeners) {
+            try {
+                switch (job.getState()) {
+                    case COMPLETED -> listener.onJobCompleted(job);
+                    case FAILED -> listener.onJobFailed(job);
+                    case CANCELLED -> listener.onJobCancelled(job);
+                    case LOST -> listener.onJobLost(job);
+                    default -> {
+                        return;
+                    }
+                }
+            } catch (RuntimeException e) {
+                System.err.println("Job event listener failed for job " + job.getId()
+                        + " in state " + job.getState() + ": " + e.getMessage());
+            }
+        }
+    }
+
+    private Optional<Job> enqueueJob(Job request) {
+        return enqueueJob(request, false);
+    }
+
+    private Optional<Job> enqueueJob(Job request, boolean printStandaloneDAG) {
+        Job job=request.toBuilder()
+                .setId(Discover.nextJobId.incrementAndGet())
                 .setState(JobState.PENDING)
                 .build();
         JobEntry entry=new JobEntry(job);
@@ -41,6 +106,9 @@ final class JobManager {
         if (!jobQueue.add(job.getId())) {
             Discover.jobs.remove(job.getId(), entry);
             return Optional.empty();
+        }
+        if (printStandaloneDAG) {
+            System.out.println(DAGGraphPrinter.renderStandaloneJob(job));
         }
         dispatchQueuedJobs();
         return Optional.of(job);
@@ -128,7 +196,8 @@ final class JobManager {
             entry.finishAllocation(chosen, allocationId, true);
             if (entry.job().getState()==JobState.COMPLETED
                     || entry.job().getState()==JobState.FAILED
-                    || entry.job().getState()==JobState.CANCELLED) {
+                    || entry.job().getState()==JobState.CANCELLED
+                    || entry.job().getState()==JobState.LOST) {
                 entry.releaseResources();
                 Discover.dispatchQueuedJobs();
             }
@@ -140,8 +209,11 @@ final class JobManager {
                     + ", RoundRobin=" + nodeId(roundRobin));
             return true;
         } catch (RuntimeException e) {
-            entry.finishAllocation(null, allocationId, false);
+            boolean failed=entry.finishAllocation(null, allocationId, false);
             chosen.tally().release(pending.getCpuRequested(), pending.getMemRequested());
+            if (failed) {
+                publishTerminalJobEvent(entry.job());
+            }
             System.err.println("Allocation failed for job " + pending.getId() + ": " + e.getMessage());
             return true;
         }

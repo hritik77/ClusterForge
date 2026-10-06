@@ -43,6 +43,7 @@ enum JobState {
     HELD=4;
     CANCELLED=5;
     FAILED=6;
+    LOST=7;
 }
 
 enum NodeState {

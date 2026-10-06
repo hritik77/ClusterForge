@@ -2,13 +2,14 @@
 
 ClusterForge is a small controller/worker cluster for accepting jobs over HTTP, tracking worker capacity, and assigning jobs to workers. The controller exposes a REST API to clients and a gRPC service to workers. Each worker exposes its own gRPC service for allocation, cancellation, and status requests.
 
-> **Implementation status:** This project currently demonstrates job intake, in-memory queueing, placement, resource reservation, status tracking, and cancellation. The worker records assigned jobs but does not launch a workload process itself. Job execution and durable cluster state are not implemented.
+> **Implementation status:** This project demonstrates job intake, in-memory queueing, placement, resource reservation, status tracking, cancellation, and DAG orchestration. The worker records assigned jobs but does not launch a workload process itself. Job, DAG, and run state are in memory and are lost when the controller restarts.
 
 ## Contents
 
 - [Architecture](#architecture)
 - [Job and node lifecycle](#job-and-node-lifecycle)
 - [Scheduling and allocation](#scheduling-and-allocation)
+- [DAG execution](#dag-execution)
 - [Build](#build)
 - [Run a local cluster](#run-a-local-cluster)
 - [Configuration](#configuration)
@@ -58,6 +59,74 @@ Each worker (`com.Worker.Worker`) starts a gRPC server, registers itself with th
 
 There is no worker-side command or container launch in the current implementation. A `RUNNING` or `COMPLETED` state therefore requires a future execution integration or another status-reporting mechanism.
 
+## DAG execution
+
+The controller includes an in-memory DAG execution layer in `com.JobController.dag`. It validates registered DAG definitions, starts DAG runs, submits root tasks as ordinary ClusterForge jobs, and submits dependent tasks after all their dependencies report `COMPLETED`.
+
+The DAG layer determines **which task is ready**. It submits tasks through `JobSubmissionService`; the existing `JobManager`, `JobQ`, and active scheduler continue to determine queueing and worker placement. DAG code does not reserve resources, select workers, or call worker gRPC directly. Independent ready tasks are submitted separately and may remain pending when the existing scheduler cannot currently place them.
+
+Example internal use:
+
+```java
+DAG dag = new DAG("training", "training pipeline");
+dag.addTask(new DAGTask("preprocess", 2, 4, Set.of()));
+dag.addTask(new DAGTask("train", 4, 8, Set.of("preprocess")));
+
+Discover.dagManager.registerDAG(dag);
+DAGRun run = Discover.dagManager.startRun("training");
+```
+
+At run creation, root tasks begin `READY` and dependent tasks begin `BLOCKED`. Root tasks are then submitted as regular jobs and become `SUBMITTED`. On terminal job events, the DAG manager updates the corresponding task state. Completion may unlock dependent tasks; a failure retries the task up to its configured limit, then marks the run `FAILED`. Failed task state is not propagated to downstream tasks.
+
+DAG runs are printed to the controller console as an ASCII adjacency view when task jobs are submitted and when task states change. Each task line shows its state and, once submitted, its ClusterForge job ID; outgoing arrows show dependent tasks. A job submitted through `POST /api/jobs` has no dependency information, so the controller displays it accurately as a standalone, one-node DAG rather than inventing edges.
+
+DAG and run state is in memory. `POST /api/dags` accepts an explicit `CUSTOM_DAG` JSON specification, validates it, starts the run, and returns the graph, task states, and job IDs. `GET /api/dags/runs/{runId}` returns the current in-memory run view. There is no DAG cancellation endpoint. Job status events use the existing controller/worker protocol; workers are not DAG-aware and still do not launch workloads by themselves.
+
+### BATCH DAG parsing
+
+`com.JobController.job.parser.JobParserRegistry` includes the `BATCH` parser. A `BatchJobSpecification` is converted to exactly `count` independent tasks named `<name>-001`, `<name>-002`, and so on. Every generated task retains the same command and CPU/memory request; no dependency edges are added. This feature currently creates the DAG model only: it does not add a REST submission format, start a DAG run, or execute commands on workers.
+
+The registry also includes a `MAP_REDUCE` parser. A `MapReduceJobSpecification` creates one independent `map-001` through `map-NNN` task per partition and a single `reduce` task depending on every map task. Mapper/reducer commands and their separate CPU/memory requests are retained on the tasks. The input path is retained on the specification; distributed splitting and data movement are not implemented.
+
+The `PIPELINE` parser converts each supplied `PipelineTaskSpecification` directly into a DAG task, preserving its command, resource requests, and dependency set. It supports arbitrary DAG structures including multiple roots, joins, and diamonds. It checks basic task fields and duplicate task IDs; use `DAGValidator.validate(dag)` to reject missing dependencies and cycles. The parser only creates the graph and does not execute it.
+
+The `PARAMETER_SWEEP` parser sorts parameter names and expands the Cartesian product of their string values into independent `experiment-NNN` tasks. Each task command appends the parameter flags in sorted order and receives the specification's CPU/memory request. Parameter maps and value lists are copied and exposed read-only; this parser does not run experiments or compare results.
+
+The `CUSTOM_DAG` parser maps each explicitly specified task directly into the DAG model, preserving task IDs, commands, resources, and dependency order. It validates the completed graph with `DAGValidator`, so missing dependencies, self-dependencies, duplicate IDs, and cycles are rejected before a DAG is returned.
+
+### DAG retries and worker loss
+
+Each `DAGTask` has a `RetryPolicy`; existing constructors default to zero retries. `maxRetries` counts attempts after the first, and each retry creates a new ClusterForge job ID through the regular submission queue. Retry counts are stored per task in each `DAGRun`. Explicit job failures and worker-loss (`LOST`) events are retried according to the task policy. When retries are exhausted, the task and DAG run fail; no new dependent tasks are submitted, while already-submitted independent tasks are allowed to report their terminal state. Worker-loss handling releases the previous worker's resource reservation before notifying DAG listeners and submitting retries.
+
+### Submit and inspect an explicit DAG
+
+Use `POST /api/dags` to submit a custom DAG. The controller assigns a unique DAG ID and run ID; callers provide `jobType`, `name`, and `tasks`. Each task requires an `id`, `command`, positive integer `cpu` and `memory`, and an optional `dependsOn` string array (omit it or use `[]` for a root). The entire graph is validated before registration or job submission.
+
+```sh
+curl -i http://127.0.0.1:8080/api/dags \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jobType": "CUSTOM_DAG",
+    "name": "training-workflow",
+    "tasks": [
+      {"id":"download","command":"python download.py","cpu":2,"memory":4,"dependsOn":[]},
+      {"id":"clean","command":"python clean.py","cpu":2,"memory":4,"dependsOn":["download"]},
+      {"id":"train","command":"python train.py","cpu":8,"memory":16,"dependsOn":["clean"]},
+      {"id":"test","command":"python test.py","cpu":4,"memory":8,"dependsOn":["clean"]},
+      {"id":"deploy","command":"python deploy.py","cpu":2,"memory":4,"dependsOn":["train","test"]}
+    ]
+  }'
+```
+
+The `202 Accepted` response contains a `graph` string and a `tasks` array with dependencies, state, command, resources, and assigned `jobId` values. Save `runId` from the response and inspect it as tasks progress:
+
+```sh
+RUN_ID='paste-the-runId-from-the-submit-response'
+curl -s "http://127.0.0.1:8080/api/dags/runs/$RUN_ID"
+```
+
+Root tasks are submitted immediately through the existing job queue; dependent tasks are submitted only after their dependencies report `COMPLETED`. Ensure workers are registered and have sufficient capacity. At present the worker records allocations but does not execute the command; DAG commands are metadata for the future execution layer. Invalid JSON, fields, dependencies, duplicate task IDs, self-dependencies, and cycles are rejected with `400 Bad Request`.
+
 ## Job and node lifecycle
 
 ### Job states
@@ -70,13 +139,14 @@ The protocol defines these job states:
 | `ALLOCATED` | A worker accepted the allocation and the controller reserved resources. |
 | `RUNNING` | Available in the protocol, but not set by the current worker implementation. |
 | `COMPLETED` | Terminal; reported status releases the controller's resource reservation. |
-| `FAILED` | Terminal; reported status or worker failure releases the reservation. |
+| `FAILED` | Terminal; workload failure or allocation failure. |
 | `CANCELLED` | Terminal; cancellation releases the reservation. |
+| `LOST` | Terminal; the controller marked the job lost after its worker went down and released its reservation. |
 | `HELD` | Defined in the protocol, but not currently used by the scheduler. |
 
 Normal progression is `PENDING` → `ALLOCATED`. The protocol allows later states to be reported by workers; terminal states are `COMPLETED`, `FAILED`, and `CANCELLED`.
 
-If a worker stops sending heartbeats, the controller marks its node `DOWN` after approximately 15 seconds without a heartbeat. The failure detector checks periodically (about every two seconds). Jobs currently assigned to that node are marked `FAILED` and their reservations are released. They are **not** automatically requeued or retried.
+If a worker stops sending heartbeats, the controller marks its node `DOWN` after approximately 15 seconds without a heartbeat. The failure detector checks periodically (about every two seconds). Jobs currently assigned to that node are marked `LOST`, their reservations are released before DAG listeners are notified, and associated DAG tasks may retry according to their policy. Standalone jobs have no retry policy and are not automatically resubmitted.
 
 ### Node states
 
@@ -332,7 +402,7 @@ The gRPC channels use plaintext transport in the current implementation. Do not 
 - **Worker does not register:** verify that the controller gRPC port is reachable from the worker and that `clusterforge.controller.host` and `clusterforge.controller.port` are correct.
 - **Controller cannot allocate to a worker:** verify that the advertised `clusterforge.worker.host:clusterforge.worker.port` is reachable from the controller. A worker may be able to connect outbound to the controller even when its advertised inbound address is incorrect.
 - **Job remains `PENDING`:** verify that at least one worker is registered, not `DOWN` or `MAINTENANCE`, and has enough available CPU and memory for the job. Pending jobs are retried on dispatch triggers; jobs that do not fit are retained.
-- **Job becomes `FAILED` during allocation:** inspect controller output and worker logs for the allocation error. An allocation RPC error or worker rejection fails the job; the controller does not retry it automatically.
+- **Job becomes `FAILED` during allocation:** inspect controller output and worker logs for the allocation error. An allocation RPC error or worker rejection fails the job; a DAG task retries according to its policy, while a standalone job is not automatically resubmitted.
 - **Node marked `DOWN`:** check worker liveness, network connectivity, and heartbeat logs. The controller uses a roughly 15-second heartbeat timeout.
 - **Scheduler comparison output:** each successful allocation prints the active Least Loaded node and comparison-only First Fit, Best Fit, and Round Robin nodes. These lines are for observing policy differences; only Least Loaded controls allocation.
 - **Port is already in use:** change the relevant controller REST/gRPC port or the worker port with the system properties in [Configuration](#configuration).
@@ -344,6 +414,8 @@ src/main/java/com/JobController/
   Discover.java                 Controller entry point, node/job state, gRPC callbacks
   RestApiServer.java             HTTP/JSON job API
   JobManager.java                Pending queue dispatcher and worker allocation
+  JobSubmissionService.java       Submission abstraction used by DAG execution
+  JobEventListener.java           Terminal job lifecycle event contract
   JobQ.java                      Bounded in-memory FIFO of pending job IDs
   Scheduler.java                 Node-selection interface
   LeastLoadedSchedular.java      Active allocation policy
@@ -352,6 +424,13 @@ src/main/java/com/JobController/
   RoundRobinSchedular.java       Comparison-only policy
   SchedulerSupport.java          Shared node eligibility rules
   WorkerClientRegistry.java      Cached controller-to-worker gRPC clients
+  dag/
+    DAG.java                      In-memory DAG definition
+    DAGTask.java                  Immutable task definition
+    DAGRun.java                   Per-run task/job mapping and run state
+    DAGRunState.java              DAG run lifecycle states
+    DAGValidator.java             Validation and graph/state queries
+    DAGManager.java                DAG registration and job lifecycle orchestration
 src/main/java/com/Worker/
   Worker.java                    Worker gRPC server, registration and heartbeat
   JobMap.java                    Worker-side in-memory job records

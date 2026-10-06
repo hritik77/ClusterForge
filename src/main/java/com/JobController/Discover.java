@@ -3,11 +3,18 @@ package com.JobController;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.stub.StreamObserver;
+import com.JobController.dag.DAG;
+import com.JobController.dag.DAGRun;
+import com.JobController.dag.DAGManager;
+import com.JobController.job.parser.JobParserRegistry;
+import com.JobController.job.spec.CustomDAGJobSpecification;
+import com.JobController.job.spec.CustomDAGTaskSpecification;
 
 import java.io.IOException;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -109,7 +116,8 @@ final class JobEntry {
         return true;
     }
 
-    synchronized void finishAllocation(NodeEntry node, int allocationId, boolean successful) {
+    synchronized boolean finishAllocation(NodeEntry node, int allocationId, boolean successful) {
+        boolean failed=false;
         if (successful) {
             this.node=node;
             this.allocationId=allocationId;
@@ -118,9 +126,11 @@ final class JobEntry {
             }
         } else if (job.getState()==JobState.PENDING) {
             job=job.toBuilder().setState(JobState.FAILED).build();
+            failed=true;
         }
         dispatching=false;
         notifyAll();
+        return failed;
     }
 
     synchronized boolean awaitAllocation(long timeoutMillis) throws InterruptedException {
@@ -147,7 +157,7 @@ final class JobEntry {
 
     private static boolean isTerminal(JobState state) {
         return state==JobState.COMPLETED || state==JobState.FAILED
-                || state==JobState.CANCELLED;
+                || state==JobState.CANCELLED || state==JobState.LOST;
     }
 
     /** Gives CPU/mem back to the node exactly once, however many times it is called. */
@@ -165,6 +175,12 @@ public class Discover implements RestApiServer.JobOperations {
     static final AtomicInteger allocationKey=new AtomicInteger();
     static final WorkerClientRegistry workers=new WorkerClientRegistry();
     static final JobManager jobManager=new JobManager(new LeastLoadedSchedular());
+    static final DAGManager dagManager=new DAGManager(jobManager);
+    private static final JobParserRegistry jobParserRegistry=new JobParserRegistry();
+
+    static {
+        jobManager.addJobEventListener(dagManager);
+    }
 
     // nodeId -> [node, nodeResourceTally, lastHeartBeat]
     static final ConcurrentHashMap<Integer, NodeEntry> nodes=new ConcurrentHashMap<>();
@@ -176,6 +192,24 @@ public class Discover implements RestApiServer.JobOperations {
     public Optional<Job> submitJob(String owner, String description, int cpuRequested,
                                   int memRequested) {
         return jobManager.submitJob(owner, description, cpuRequested, memRequested);
+    }
+
+    @Override
+    public RestApiServer.DAGSubmission submitDAG(
+            String name, List<CustomDAGTaskSpecification> tasks) {
+        String dagId="custom-dag-" + UUID.randomUUID();
+        CustomDAGJobSpecification specification =
+                new CustomDAGJobSpecification(dagId, name, tasks);
+        DAG dag=jobParserRegistry.parse(specification);
+        dagManager.registerDAG(dag);
+        DAGRun run=dagManager.startRun(dag.getId());
+        return new RestApiServer.DAGSubmission(dag, run);
+    }
+
+    @Override
+    public Optional<RestApiServer.DAGSubmission> findDAGRun(String runId) {
+        return dagManager.findRun(runId).flatMap(run -> dagManager.findDAG(run.getDagId())
+                .map(dag -> new RestApiServer.DAGSubmission(dag, run)));
     }
 
     @Override
@@ -212,13 +246,15 @@ public class Discover implements RestApiServer.JobOperations {
             return new RestApiServer.CancellationResult(
                     RestApiServer.CancellationOutcome.ALREADY_CANCELLED, current);
         }
-        if (current.getState()==JobState.COMPLETED || current.getState()==JobState.FAILED) {
+        if (current.getState()==JobState.COMPLETED || current.getState()==JobState.FAILED
+                || current.getState()==JobState.LOST) {
             return new RestApiServer.CancellationResult(
                     RestApiServer.CancellationOutcome.NOT_CANCELLABLE, current);
         }
 
         if (entry.cancelIfQueued()) {
             jobManager.removeQueuedJob(id);
+            jobManager.publishTerminalJobEvent(entry.job());
             return new RestApiServer.CancellationResult(
                     RestApiServer.CancellationOutcome.CANCELLED, entry.job());
         }
@@ -248,12 +284,14 @@ public class Discover implements RestApiServer.JobOperations {
                                 ? RestApiServer.CancellationOutcome.ALREADY_CANCELLED
                                 : latest.getState()==JobState.COMPLETED
                                         || latest.getState()==JobState.FAILED
+                                        || latest.getState()==JobState.LOST
                                         ? RestApiServer.CancellationOutcome.NOT_CANCELLABLE
                                         : RestApiServer.CancellationOutcome.UNAVAILABLE;
                 return new RestApiServer.CancellationResult(outcome, latest);
             }
             entry.releaseResources();
             dispatchQueuedJobs();
+            jobManager.publishTerminalJobEvent(entry.job());
             return new RestApiServer.CancellationResult(
                     RestApiServer.CancellationOutcome.CANCELLED, entry.job());
         } catch (RuntimeException e) {
@@ -271,9 +309,12 @@ public class Discover implements RestApiServer.JobOperations {
                     .getJobStatus(Job.newBuilder().setId(id).build());
             JobState workerState=workerJob.getState();
             if (workerState==JobState.CANCELLED || workerState==JobState.COMPLETED
-                    || workerState==JobState.FAILED) {
-                entry.setState(workerState);
+                    || workerState==JobState.FAILED || workerState==JobState.LOST) {
+                boolean transitioned=entry.setState(workerState);
                 entry.releaseResources();
+                if (transitioned) {
+                    jobManager.publishTerminalJobEvent(entry.job());
+                }
             }
         } catch (RuntimeException e) {
             System.err.println("Could not refresh job state after cancellation failure: "
@@ -286,6 +327,7 @@ public class Discover implements RestApiServer.JobOperations {
                         ? RestApiServer.CancellationOutcome.ALREADY_CANCELLED
                         : current.getState()==JobState.COMPLETED
                                 || current.getState()==JobState.FAILED
+                                || current.getState()==JobState.LOST
                                 ? RestApiServer.CancellationOutcome.NOT_CANCELLABLE
                                 : RestApiServer.CancellationOutcome.UNAVAILABLE;
         return new RestApiServer.CancellationResult(outcome, current);
@@ -322,21 +364,20 @@ public class Discover implements RestApiServer.JobOperations {
         }, 1, 2, TimeUnit.SECONDS);
     }
 
-    private static void markNodeDown(NodeEntry n) {
+    static void markNodeDown(NodeEntry n) {
        n.markDown();
        System.out.println("Node " + n.nodeId() + " missed heartbeats; marked DOWN");
 
        for (JobEntry e : jobs.values()) {
            if (e.node()==n) {
-               JobState s=e.job().getState();
-               if (s!=JobState.COMPLETED && s!=JobState.FAILED && s!=JobState.CANCELLED) {
-                   e.setState(JobState.FAILED);   // or reset to PENDING and reallocate
+               if (e.setState(JobState.LOST)) {
                    e.releaseResources();
+                   jobManager.publishTerminalJobEvent(e.job());
                    dispatchQueuedJobs();
                }
            }
        }
-   }
+    }
 
     public static class NodeManager extends WorkerToControllerGrpc.WorkerToControllerImplBase {
 
@@ -394,11 +435,14 @@ public class Discover implements RestApiServer.JobOperations {
                 return;
             }
 
-            entry.setState(j.getState());
+            boolean transitioned=entry.setState(j.getState());
             switch (j.getState()) {
-                case COMPLETED, FAILED, CANCELLED -> {
+                case COMPLETED, FAILED, CANCELLED, LOST -> {
                     entry.releaseResources();
                     dispatchQueuedJobs();
+                    if (transitioned) {
+                        jobManager.publishTerminalJobEvent(entry.job());
+                    }
                 }
                 default -> { }
             }
