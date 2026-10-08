@@ -10,6 +10,7 @@ import java.util.Set;
 public final class DAG {
     private final String id;
     private final String name;
+    private final Long dagTimeoutMillis;
     private final Map<String, DAGTask> tasks = new LinkedHashMap<>();
     private final Map<String, Set<String>> dependents = new LinkedHashMap<>();
     private final Map<String, DAGTask> readOnlyTasks = Collections.unmodifiableMap(tasks);
@@ -17,14 +18,22 @@ public final class DAG {
             Collections.unmodifiableMap(dependents);
 
     public DAG(String id, String name) {
+        this(id, name, null);
+    }
+
+    public DAG(String id, String name, Long dagTimeoutMillis) {
         if (id == null || id.isBlank()) {
             throw new IllegalArgumentException("DAG ID must not be null or blank");
         }
         if (name == null || name.isBlank()) {
             throw new IllegalArgumentException("DAG name must not be null or blank");
         }
+        if (dagTimeoutMillis != null && dagTimeoutMillis <= 0) {
+            throw new IllegalArgumentException("dagTimeoutMillis must be positive");
+        }
         this.id = id;
         this.name = name;
+        this.dagTimeoutMillis = dagTimeoutMillis;
     }
 
     public String getId() {
@@ -33,6 +42,14 @@ public final class DAG {
 
     public String getName() {
         return name;
+    }
+
+    public Long getDagTimeoutMillis() {
+        return dagTimeoutMillis;
+    }
+
+    public boolean hasDagTimeout() {
+        return dagTimeoutMillis != null;
     }
 
     public void addTask(DAGTask task) {

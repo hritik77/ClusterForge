@@ -74,6 +74,23 @@ public class MapReduceJobParserTest {
     }
 
     @Test
+    public void copiesIndependentMapAndReduceGpuAndDiskRequests() {
+        MapReduceJobSpecification specification = new MapReduceJobSpecification(
+                "gpu-map-reduce", "logs", "logs/", "map", "reduce", 2,
+                2, 4, 4, 8, 512, 1, 4_096, 1_024, 2, 8_192);
+        DAG dag = parser.parse(specification);
+
+        DAGTask map = dag.getTask("map-001");
+        assertEquals(512, map.getDiskMbRequested());
+        assertEquals(1, map.getGpuCountRequested());
+        assertEquals(4_096, map.getGpuMemoryMbPerGpu());
+        DAGTask reduce = dag.getTask("reduce");
+        assertEquals(1_024, reduce.getDiskMbRequested());
+        assertEquals(2, reduce.getGpuCountRequested());
+        assertEquals(8_192, reduce.getGpuMemoryMbPerGpu());
+    }
+
+    @Test
     public void mapIdsAreDeterministic() {
         MapReduceJobSpecification specification = specification(4);
 

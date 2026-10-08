@@ -59,6 +59,19 @@ public class BatchJobParserTest {
     }
 
     @Test
+    public void copiesDiskAndGpuRequirementsToEveryGeneratedTask() {
+        DAG dag = parser.parse(new BatchJobSpecification(
+                "gpu-batch", "simulation", "python simulation.py", 2,
+                2, 4, 1_024, 1, 8_192));
+
+        for (DAGTask task : dag.getTasks().values()) {
+            assertEquals(1_024, task.getDiskMbRequested());
+            assertEquals(1, task.getGpuCountRequested());
+            assertEquals(8_192, task.getGpuMemoryMbPerGpu());
+        }
+    }
+
+    @Test
     public void taskIdsAreDeterministicAcrossParses() {
         BatchJobSpecification specification = specification(
                 "stable-job", "batch", 4, 1, 1);

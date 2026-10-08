@@ -69,4 +69,17 @@ public class DAGTaskTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new DAGTask("invalid", 1, 1, Set.of(), (RetryPolicy) null));
     }
+
+    @Test
+    public void storesAndValidatesTimeoutPolicy() {
+        TimeoutPolicy policy = new TimeoutPolicy(250L);
+        DAGTask task = new DAGTask("timed", 1, 1, Set.of(), policy);
+
+        assertEquals(policy, task.getTimeoutPolicy());
+        assertEquals(Long.valueOf(250), task.getTimeoutPolicy().getTaskTimeoutMillis());
+        assertThrows(IllegalArgumentException.class, () -> new TimeoutPolicy(0L));
+        assertThrows(IllegalArgumentException.class, () -> new TimeoutPolicy(-1L));
+        assertThrows(IllegalArgumentException.class,
+                () -> new DAGTask("invalid", 1, 1, Set.of(), (TimeoutPolicy) null));
+    }
 }

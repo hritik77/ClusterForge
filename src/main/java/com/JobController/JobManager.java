@@ -31,11 +31,32 @@ final class JobManager implements JobSubmissionService {
     }
 
     Optional<Job> submitJob(String owner, String description, int cpuRequested, int memRequested) {
+        return submitJob(owner, description, cpuRequested, memRequested, 0, 0, 0, List.of());
+    }
+
+    Optional<Job> submitJob(String owner, String description, int cpuRequested, int memRequested,
+                            long diskMbRequested, int gpuCountRequested,
+                            long gpuMemoryMbPerGpu,
+                            List<com.JobController.PlacementConstraint> constraints) {
+        if (cpuRequested <= 0 || memRequested <= 0 || diskMbRequested < 0
+                || gpuCountRequested < 0 || gpuMemoryMbPerGpu < 0) {
+            throw new IllegalArgumentException(
+                    "CPU/memory must be positive and disk/GPU requests non-negative");
+        }
+        if (gpuCountRequested == 0 && gpuMemoryMbPerGpu != 0) {
+            throw new IllegalArgumentException(
+                    "GPU memory request requires at least one requested GPU");
+        }
+        validatePlacementConstraints(constraints);
         Job job=Job.newBuilder()
                 .setOwner(owner)
                 .setDescription(description)
                 .setCpuRequested(cpuRequested)
                 .setMemRequested(memRequested)
+                .setDiskMbRequested(diskMbRequested)
+                .setGpuCountRequested(gpuCountRequested)
+                .setGpuMemoryMbPerGpu(gpuMemoryMbPerGpu)
+                .addAllPlacementConstraints(constraints)
                 .setState(JobState.PENDING)
                 .build();
         return enqueueJob(job, true);
@@ -52,12 +73,31 @@ final class JobManager implements JobSubmissionService {
         if (job.getOwner().isBlank() || job.getDescription().isBlank()) {
             throw new IllegalArgumentException("Job owner and description are required");
         }
-        if (job.getCpuRequested() <= 0 || job.getMemRequested() <= 0) {
-            throw new IllegalArgumentException("Job CPU and memory requests must be positive");
+        if (job.getCpuRequested() <= 0 || job.getMemRequested() <= 0
+                || job.getDiskMbRequested() < 0 || job.getGpuCountRequested() < 0
+                || job.getGpuMemoryMbPerGpu() < 0) {
+            throw new IllegalArgumentException(
+                    "Job CPU/memory must be positive and disk/GPU requests non-negative");
         }
+        if (job.getGpuCountRequested() == 0 && job.getGpuMemoryMbPerGpu() != 0) {
+            throw new IllegalArgumentException(
+                    "GPU memory request requires at least one requested GPU");
+        }
+        validatePlacementConstraints(job.getPlacementConstraintsList());
 
         return enqueueJob(job).map(Job::getId)
                 .orElseThrow(() -> new IllegalStateException("Job queue is full"));
+    }
+
+    private static void validatePlacementConstraints(
+            List<com.JobController.PlacementConstraint> constraints) {
+        for (com.JobController.PlacementConstraint constraint : constraints) {
+            if (constraint.getKey().isBlank() || constraint.getValue().isBlank()
+                    || constraint.getOperator()
+                            == com.JobController.PlacementOperator.UNRECOGNIZED) {
+                throw new IllegalArgumentException("Invalid job placement constraint");
+            }
+        }
     }
 
     void addJobEventListener(JobEventListener listener) {
@@ -79,15 +119,158 @@ final class JobManager implements JobSubmissionService {
                     case FAILED -> listener.onJobFailed(job);
                     case CANCELLED -> listener.onJobCancelled(job);
                     case LOST -> listener.onJobLost(job);
-                    default -> {
-                        return;
-                    }
+                    default -> { return; }
                 }
             } catch (RuntimeException e) {
                 System.err.println("Job event listener failed for job " + job.getId()
                         + " in state " + job.getState() + ": " + e.getMessage());
             }
         }
+    }
+
+    void publishJobStateChanged(Job job) {
+        if (job == null) {
+            throw new IllegalArgumentException("Job must not be null");
+        }
+        for (JobEventListener listener : jobEventListeners) {
+            try {
+                listener.onJobStateChanged(job);
+            } catch (RuntimeException e) {
+                System.err.println("Job state listener failed for job " + job.getId()
+                        + " in state " + job.getState() + ": " + e.getMessage());
+            }
+        }
+    }
+
+    @Override
+    public boolean cancel(long jobId) {
+        if (jobId <= 0 || jobId > Integer.MAX_VALUE) {
+            return false;
+        }
+        RestApiServer.CancellationResult result =
+                cancelJob((int) jobId);
+        return result.outcome() == RestApiServer.CancellationOutcome.CANCELLED
+                || result.outcome() == RestApiServer.CancellationOutcome.ALREADY_CANCELLED;
+    }
+
+    RestApiServer.CancellationResult cancelJob(int jobId) {
+        JobEntry entry = Discover.jobs.get(jobId);
+        if (entry == null) {
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.NOT_FOUND, null);
+        }
+
+        try {
+            if (!entry.awaitAllocation(5_500)) {
+                return new RestApiServer.CancellationResult(
+                        RestApiServer.CancellationOutcome.UNAVAILABLE, entry.job());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.UNAVAILABLE, entry.job());
+        }
+
+        Job current = entry.job();
+        if (current.getState() == JobState.CANCELLED) {
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.ALREADY_CANCELLED, current);
+        }
+        if (current.getState() == JobState.COMPLETED || current.getState() == JobState.FAILED
+                || current.getState() == JobState.LOST) {
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.NOT_CANCELLABLE, current);
+        }
+
+        if (entry.cancelIfQueued()) {
+            jobQueue.remove(jobId);
+            publishTerminalJobEvent(entry.job());
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.CANCELLED, entry.job());
+        }
+
+        if (entry.node() == null) {
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.UNAVAILABLE, entry.job());
+        }
+
+        try {
+            WorkerClientRegistry.WorkerClient client = Discover.workers.getOrConnect(
+                    entry.node().nodeId(), entry.node().node().getAgentEndpoint());
+            Cnf reply = client.stub()
+                    .withDeadlineAfter(15, TimeUnit.SECONDS)
+                    .cancelAllocated(JobRef.newBuilder().setId(jobId).build());
+            if (!reply.getSuccess() || reply.getState() != JobState.CANCELLED) {
+                System.err.println("Worker rejected cancellation for job " + jobId + ": "
+                        + reply.getMessage());
+                return refreshCancellationState(jobId, entry);
+            }
+            if (!entry.tryCancel()) {
+                Job latest = entry.job();
+                System.err.println("Job " + jobId + " changed state during cancellation to "
+                        + latest.getState());
+                RestApiServer.CancellationOutcome outcome =
+                        latest.getState() == JobState.CANCELLED
+                                ? RestApiServer.CancellationOutcome.ALREADY_CANCELLED
+                                : latest.getState() == JobState.COMPLETED
+                                        || latest.getState() == JobState.FAILED
+                                        || latest.getState() == JobState.LOST
+                                        ? RestApiServer.CancellationOutcome.NOT_CANCELLABLE
+                                        : RestApiServer.CancellationOutcome.UNAVAILABLE;
+                return new RestApiServer.CancellationResult(outcome, latest);
+            }
+            entry.releaseResources();
+            dispatchQueuedJobs();
+            publishTerminalJobEvent(entry.job());
+            return new RestApiServer.CancellationResult(
+                    RestApiServer.CancellationOutcome.CANCELLED, entry.job());
+        } catch (RuntimeException e) {
+            System.err.println("Cancel failed for job " + jobId + ": " + e.getMessage());
+            return refreshCancellationState(jobId, entry);
+        }
+    }
+
+    private RestApiServer.CancellationResult refreshCancellationState(
+            int jobId, JobEntry entry) {
+        try {
+            WorkerClientRegistry.WorkerClient client = Discover.workers.getOrConnect(
+                    entry.node().nodeId(), entry.node().node().getAgentEndpoint());
+            Job workerJob = client.stub()
+                    .withDeadlineAfter(5, TimeUnit.SECONDS)
+                    .getJobStatus(Job.newBuilder().setId(jobId).build());
+            JobState workerState = workerJob.getState();
+            if (workerState == JobState.CANCELLED || workerState == JobState.COMPLETED
+                    || workerState == JobState.FAILED || workerState == JobState.LOST) {
+                boolean transitioned = entry.setState(workerState);
+                entry.releaseResources();
+                if (transitioned) {
+                    publishTerminalJobEvent(entry.job());
+                }
+            }
+        } catch (RuntimeException e) {
+            System.err.println("Could not refresh job state after cancellation failure: "
+                    + e.getMessage());
+        }
+
+        Job current = entry.job();
+        RestApiServer.CancellationOutcome outcome =
+                current.getState() == JobState.CANCELLED
+                        ? RestApiServer.CancellationOutcome.ALREADY_CANCELLED
+                        : current.getState() == JobState.COMPLETED
+                                || current.getState() == JobState.FAILED
+                                || current.getState() == JobState.LOST
+                                ? RestApiServer.CancellationOutcome.NOT_CANCELLABLE
+                                : RestApiServer.CancellationOutcome.UNAVAILABLE;
+        return new RestApiServer.CancellationResult(outcome, current);
+    }
+
+    @Override
+    public Optional<Job> find(long jobId) {
+        if (jobId <= 0 || jobId > Integer.MAX_VALUE) {
+            return Optional.empty();
+        }
+        JobEntry entry = Discover.jobs.get((int) jobId);
+        return entry == null ? Optional.empty() : Optional.of(entry.job());
     }
 
     private Optional<Job> enqueueJob(Job request) {
@@ -126,8 +309,8 @@ final class JobManager implements JobSubmissionService {
         return entry==null ? Optional.empty() : Optional.of(entry.job());
     }
 
-    void removeQueuedJob(int jobId) {
-        jobQueue.remove(jobId);
+    boolean removeQueuedJob(long jobId) {
+        return jobQueue.remove(jobId);
     }
 
     void shutdown() {
@@ -138,6 +321,28 @@ final class JobManager implements JobSubmissionService {
         if (!dispatcher.isShutdown()) {
             dispatcher.execute(this::drainQueue);
         }
+    }
+
+    void onWorkerDown(String workerUUID) {
+        if (workerUUID == null || workerUUID.isBlank()) {
+            throw new IllegalArgumentException("Worker UUID must not be blank");
+        }
+        for (JobEntry entry : Discover.jobs.values()) {
+            NodeEntry assignedNode = entry.node();
+            if (assignedNode != null && workerUUID.equals(assignedNode.workerUUID())
+                    && entry.setState(JobState.LOST)) {
+                entry.releaseResources();
+                publishTerminalJobEvent(entry.job());
+            }
+        }
+        dispatchQueuedJobs();
+    }
+
+    void onWorkerRecovered(String workerUUID) {
+        if (workerUUID == null || workerUUID.isBlank()) {
+            throw new IllegalArgumentException("Worker UUID must not be blank");
+        }
+        dispatchQueuedJobs();
     }
 
     private void drainQueue() {
@@ -168,32 +373,47 @@ final class JobManager implements JobSubmissionService {
         Optional<NodeEntry> bestFit=bestFitScheduler.selectNode(pending, candidates);
         Optional<NodeEntry> roundRobin=roundRobinScheduler.selectNode(pending, candidates);
         NodeEntry chosen=selected.get();
-        NodeState state=chosen.node().getState();
-        if (state==NodeState.DOWN || state==NodeState.MAINTENANCE
-                || !chosen.tally().tryReserve(pending.getCpuRequested(), pending.getMemRequested())) {
+        List<String> assignedGpuIds = chosen.tally().tryReserve(pending);
+        if (assignedGpuIds == null) {
             return false;
         }
 
         int allocationId=Discover.allocationKey.incrementAndGet();
-        if (!entry.beginAllocation()) {
-            chosen.tally().release(pending.getCpuRequested(), pending.getMemRequested());
+        if (!entry.beginAllocation(chosen)) {
+            chosen.tally().release(pending.getId());
             return false;
+        }
+
+        com.JobController.worker.WorkerMembership membership =
+                Discover.membershipManager.getWorker(chosen.workerUUID());
+        if (membership != null && !membership.isEligibleForScheduling()) {
+            chosen.tally().release(pending.getId());
+            entry.abortAllocation();
+            return entry.job().getState() != JobState.PENDING;
         }
 
         try {
             WorkerClientRegistry.WorkerClient client=Discover.workers.getOrConnect(
                     chosen.nodeId(), chosen.node().getAgentEndpoint());
+            Job allocationJob = entry.job().toBuilder()
+                    .setAssignedWorkerId(chosen.workerId())
+                    .putAllAssignedWorkerLabels(chosen.labels())
+                    .build();
             Cnf reply=client.stub()
                     .withDeadlineAfter(5, TimeUnit.SECONDS)
                     .allocate(AllocationCommand.newBuilder()
                             .setAllocationId(allocationId)
-                            .setJob(entry.job())
+                            .setJob(allocationJob)
+                            .addAllGpuDeviceIds(assignedGpuIds)
                             .build());
             if (!reply.getSuccess()) {
                 throw new IllegalStateException(
                         "Worker rejected job " + pending.getId() + ": " + reply.getMessage());
             }
-            entry.finishAllocation(chosen, allocationId, true);
+            entry.finishAllocation(chosen, allocationId, true, allocationJob);
+            if (entry.job().getState() == JobState.ALLOCATED) {
+                publishJobStateChanged(entry.job());
+            }
             if (entry.job().getState()==JobState.COMPLETED
                     || entry.job().getState()==JobState.FAILED
                     || entry.job().getState()==JobState.CANCELLED
@@ -209,8 +429,8 @@ final class JobManager implements JobSubmissionService {
                     + ", RoundRobin=" + nodeId(roundRobin));
             return true;
         } catch (RuntimeException e) {
-            boolean failed=entry.finishAllocation(null, allocationId, false);
-            chosen.tally().release(pending.getCpuRequested(), pending.getMemRequested());
+            boolean failed=entry.finishAllocation(null, allocationId, false, entry.job());
+            chosen.tally().release(pending.getId());
             if (failed) {
                 publishTerminalJobEvent(entry.job());
             }

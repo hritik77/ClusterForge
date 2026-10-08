@@ -115,6 +115,19 @@ public class ParameterSweepJobParserTest {
     }
 
     @Test
+    public void copiesDiskAndGpuRequestsToEveryExperiment() {
+        DAG dag = parser.parse(new ParameterSweepJobSpecification(
+                "gpu-sweep", "sweep", "python train.py", Map.of("A", List.of("1", "2")),
+                2, 4, 2_048, 1, 8_192));
+
+        for (DAGTask task : dag.getTasks().values()) {
+            assertEquals(2_048, task.getDiskMbRequested());
+            assertEquals(1, task.getGpuCountRequested());
+            assertEquals(8_192, task.getGpuMemoryMbPerGpu());
+        }
+    }
+
+    @Test
     public void rejectsEmptyParameterMap() {
         assertThrows(IllegalArgumentException.class,
                 () -> specification(Map.of()));

@@ -24,6 +24,35 @@ message Node{
     int32 cpu=4;
     int32 mem=5;
     string agent_endpoint = 6;
+    int64 disk_mb = 7;
+    repeated GPUDevice gpu_devices = 8;
+    map<string, string> labels = 9;
+
+    // Phase 9: Worker membership / failure-detection fields.
+    // worker_uuid: stable logical identity that survives process restarts.
+    string worker_uuid = 10;
+    // incarnation_id: unique token generated per worker-process start; monotonically
+    //   increasing so that the controller can detect restarts.
+    string incarnation_id = 11;
+    // heartbeat_sequence: per-incarnation monotonic counter used to detect stale/
+    //   duplicate heartbeats.
+    int64 heartbeat_sequence = 12;
+}
+
+message GPUDevice {
+    string id = 1;
+    int64 memory_mb = 2;
+}
+
+enum PlacementOperator {
+    EQUALS = 0;
+    NOT_EQUALS = 1;
+}
+
+message PlacementConstraint {
+    string key = 1;
+    PlacementOperator operator = 2;
+    string value = 3;
 }
 
 message JobRef {
@@ -33,6 +62,7 @@ message JobRef {
 message AllocationCommand {
     int32 allocation_id=1; // idempotency key
     Job job=2;
+    repeated string gpu_device_ids = 3;
 }
 
 enum JobState {
@@ -58,6 +88,7 @@ message Cnf {
     bool success = 2;
     int32 node_id = 3;
     string message = 4;
+    JobState state = 5;
 }
 
 message Job {
@@ -67,4 +98,10 @@ message Job {
     string description=4;
     int32 cpuRequested=5;
     int32 memRequested=6;
+    int64 disk_mb_requested=7;
+    int32 gpu_count_requested=8;
+    int64 gpu_memory_mb_per_gpu=9;
+    repeated PlacementConstraint placement_constraints = 10;
+    string assigned_worker_id = 11;
+    map<string, string> assigned_worker_labels = 12;
 }

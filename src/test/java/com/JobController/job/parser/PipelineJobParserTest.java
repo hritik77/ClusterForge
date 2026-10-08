@@ -102,6 +102,18 @@ public class PipelineJobParserTest {
     }
 
     @Test
+    public void copiesDiskAndGpuRequests() {
+        PipelineTaskSpecification task = new PipelineTaskSpecification(
+                "train", "python train.py", 8, 16, 2_048, 1, 12_288, Set.of());
+
+        DAGTask parsed = parser.parse(specification(task)).getTask("train");
+
+        assertEquals(2_048, parsed.getDiskMbRequested());
+        assertEquals(1, parsed.getGpuCountRequested());
+        assertEquals(12_288, parsed.getGpuMemoryMbPerGpu());
+    }
+
+    @Test
     public void rejectsEmptyTaskListAndInvalidTaskFields() {
         assertThrows(IllegalArgumentException.class,
                 () -> parser.parse(specification(List.of())));

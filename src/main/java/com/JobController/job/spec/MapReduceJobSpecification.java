@@ -11,6 +11,12 @@ public final class MapReduceJobSpecification extends JobSpecification {
     private final int mapMemory;
     private final int reduceCpu;
     private final int reduceMemory;
+    private final long mapDiskMb;
+    private final int mapGpuCount;
+    private final long mapGpuMemoryMbPerGpu;
+    private final long reduceDiskMb;
+    private final int reduceGpuCount;
+    private final long reduceGpuMemoryMbPerGpu;
 
     public MapReduceJobSpecification(
             String jobId,
@@ -23,6 +29,27 @@ public final class MapReduceJobSpecification extends JobSpecification {
             int mapMemory,
             int reduceCpu,
             int reduceMemory) {
+        this(jobId, name, input, mapperCommand, reducerCommand, partitions,
+                mapCpu, mapMemory, reduceCpu, reduceMemory, 0, 0, 0, 0, 0, 0);
+    }
+
+    public MapReduceJobSpecification(
+            String jobId,
+            String name,
+            String input,
+            String mapperCommand,
+            String reducerCommand,
+            int partitions,
+            int mapCpu,
+            int mapMemory,
+            int reduceCpu,
+            int reduceMemory,
+            long mapDiskMb,
+            int mapGpuCount,
+            long mapGpuMemoryMbPerGpu,
+            long reduceDiskMb,
+            int reduceGpuCount,
+            long reduceGpuMemoryMbPerGpu) {
         super(jobId, name);
         if (input == null || input.isBlank()) {
             throw new IllegalArgumentException("MapReduce input must not be null or blank");
@@ -50,6 +77,15 @@ public final class MapReduceJobSpecification extends JobSpecification {
         if (reduceMemory <= 0) {
             throw new IllegalArgumentException("Reduce task memory must be positive");
         }
+        if (mapDiskMb < 0 || mapGpuCount < 0 || mapGpuMemoryMbPerGpu < 0
+                || reduceDiskMb < 0 || reduceGpuCount < 0 || reduceGpuMemoryMbPerGpu < 0) {
+            throw new IllegalArgumentException("Additional resource requests cannot be negative");
+        }
+        if ((mapGpuCount == 0 && mapGpuMemoryMbPerGpu != 0)
+                || (reduceGpuCount == 0 && reduceGpuMemoryMbPerGpu != 0)) {
+            throw new IllegalArgumentException(
+                    "GPU memory request requires at least one requested GPU");
+        }
 
         this.input = input;
         this.mapperCommand = mapperCommand;
@@ -59,6 +95,12 @@ public final class MapReduceJobSpecification extends JobSpecification {
         this.mapMemory = mapMemory;
         this.reduceCpu = reduceCpu;
         this.reduceMemory = reduceMemory;
+        this.mapDiskMb = mapDiskMb;
+        this.mapGpuCount = mapGpuCount;
+        this.mapGpuMemoryMbPerGpu = mapGpuMemoryMbPerGpu;
+        this.reduceDiskMb = reduceDiskMb;
+        this.reduceGpuCount = reduceGpuCount;
+        this.reduceGpuMemoryMbPerGpu = reduceGpuMemoryMbPerGpu;
     }
 
     public String getInput() {
@@ -91,6 +133,30 @@ public final class MapReduceJobSpecification extends JobSpecification {
 
     public int getReduceMemory() {
         return reduceMemory;
+    }
+
+    public long getMapDiskMb() {
+        return mapDiskMb;
+    }
+
+    public int getMapGpuCount() {
+        return mapGpuCount;
+    }
+
+    public long getMapGpuMemoryMbPerGpu() {
+        return mapGpuMemoryMbPerGpu;
+    }
+
+    public long getReduceDiskMb() {
+        return reduceDiskMb;
+    }
+
+    public int getReduceGpuCount() {
+        return reduceGpuCount;
+    }
+
+    public long getReduceGpuMemoryMbPerGpu() {
+        return reduceGpuMemoryMbPerGpu;
     }
 
     @Override

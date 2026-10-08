@@ -6,14 +6,26 @@ import io.grpc.stub.StreamObserver;
 import com.JobController.dag.DAG;
 import com.JobController.dag.DAGRun;
 import com.JobController.dag.DAGManager;
+import com.JobController.dag.DAGRunState;
+import com.JobController.failure.FailureDetector;
+import com.JobController.failure.FailureDetectorConfig;
+import com.JobController.failure.SystemTimeSource;
 import com.JobController.job.parser.JobParserRegistry;
 import com.JobController.job.spec.CustomDAGJobSpecification;
 import com.JobController.job.spec.CustomDAGTaskSpecification;
+import com.JobController.worker.WorkerFailureListener;
+import com.JobController.worker.WorkerMembership;
+import com.JobController.worker.WorkerMembershipManager;
 
 import java.io.IOException;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Collections;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -22,64 +34,251 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Total / available CPU and memory of one node. Thread-safe. */
+/** Total / available resources of one node. Thread-safe. */
 final class NodeResourceTally {
     private final int nodeId;
-    private final int totalCpu;
-    private final int totalMem;
+    private int totalCpu;
+    private int totalMem;
+    private long totalDiskMb;
+    private final Map<String, GpuResource> gpuResources = new LinkedHashMap<>();
+    private final Map<Integer, Reservation> reservations = new HashMap<>();
     private int availableCpu;
     private int availableMem;
+    private long availableDiskMb;
 
     NodeResourceTally(int nodeId, int cpu, int mem) {
+        this(nodeId, cpu, mem, 0, List.of());
+    }
+
+    NodeResourceTally(int nodeId, int cpu, int mem, long diskMb,
+                      List<com.JobController.GPUDevice> gpuDevices) {
+        if (diskMb < 0) {
+            throw new IllegalArgumentException("Node disk capacity cannot be negative");
+        }
         this.nodeId=nodeId;
         this.totalCpu=cpu;
         this.totalMem=mem;
+        this.totalDiskMb=diskMb;
         this.availableCpu=cpu;
         this.availableMem=mem;
+        this.availableDiskMb=diskMb;
+        for (com.JobController.GPUDevice gpu : gpuDevices) {
+            if (gpu.getId().isBlank() || gpu.getMemoryMb() <= 0
+                    || gpuResources.putIfAbsent(
+                            gpu.getId(), new GpuResource(gpu.getMemoryMb())) != null) {
+                throw new IllegalArgumentException(
+                        "GPU inventory requires unique non-blank IDs and positive memory");
+            }
+        }
     }
 
-    synchronized boolean tryReserve(int cpu, int mem) {
-        if (cpu > availableCpu || mem > availableMem) return false;
-        availableCpu-=cpu;
-        availableMem-=mem;
-        return true;
+    synchronized boolean canFit(Job job) {
+        return job.getCpuRequested() > 0
+                && job.getMemRequested() > 0
+                && job.getDiskMbRequested() >= 0
+                && job.getGpuCountRequested() >= 0
+                && job.getGpuMemoryMbPerGpu() >= 0
+                && (job.getGpuCountRequested() > 0 || job.getGpuMemoryMbPerGpu() == 0)
+                && job.getCpuRequested() <= availableCpu
+                && job.getMemRequested() <= availableMem
+                && job.getDiskMbRequested() <= availableDiskMb
+                && selectGpuDevices(job) != null;
     }
 
-    synchronized void release(int cpu, int mem) {
-        availableCpu=Math.min(totalCpu, availableCpu + cpu);
-        availableMem=Math.min(totalMem, availableMem + mem);
+    synchronized List<String> tryReserve(Job job) {
+        if (reservations.containsKey(job.getId()) || !canFit(job)) {
+            return null;
+        }
+        List<String> selectedGpuIds = selectGpuDevices(job);
+        for (String gpuId : selectedGpuIds) {
+            GpuResource gpu = gpuResources.get(gpuId);
+            gpu.allocated = true;
+            gpu.availableMemoryMb = 0;
+        }
+        availableCpu -= job.getCpuRequested();
+        availableMem -= job.getMemRequested();
+        availableDiskMb -= job.getDiskMbRequested();
+        reservations.put(job.getId(), new Reservation(job, selectedGpuIds));
+        return selectedGpuIds;
+    }
+
+    synchronized void reconfigure(
+            int cpu, int mem, long diskMb, List<com.JobController.GPUDevice> gpuDevices) {
+        if (cpu <= 0 || mem <= 0 || diskMb < 0) {
+            throw new IllegalArgumentException("Worker capacity values are invalid");
+        }
+        Map<String, Long> newGpuMemory = new LinkedHashMap<>();
+        for (com.JobController.GPUDevice gpu : gpuDevices) {
+            if (gpu.getId().isBlank() || gpu.getMemoryMb() <= 0
+                    || newGpuMemory.putIfAbsent(gpu.getId(), gpu.getMemoryMb()) != null) {
+                throw new IllegalArgumentException(
+                        "GPU inventory requires unique non-blank IDs and positive memory");
+            }
+        }
+
+        long usedCpu = 0;
+        long usedMem = 0;
+        long usedDisk = 0;
+        Map<String, Long> reservedGpuMemory = new HashMap<>();
+        for (Reservation reservation : reservations.values()) {
+            Job job = reservation.job();
+            usedCpu += job.getCpuRequested();
+            usedMem += job.getMemRequested();
+            usedDisk += job.getDiskMbRequested();
+            for (String gpuId : reservation.gpuIds()) {
+                Long capacity = newGpuMemory.get(gpuId);
+                if (capacity == null || capacity < job.getGpuMemoryMbPerGpu()) {
+                    throw new IllegalArgumentException(
+                            "New GPU inventory cannot satisfy existing reservation " + gpuId);
+                }
+                reservedGpuMemory.put(gpuId, capacity);
+            }
+        }
+        if (usedCpu > cpu || usedMem > mem || usedDisk > diskMb) {
+            throw new IllegalArgumentException(
+                    "New worker capacity is below resources reserved by active jobs");
+        }
+
+        Map<String, GpuResource> updatedGpus = new LinkedHashMap<>();
+        newGpuMemory.forEach((id, memoryMb) -> {
+            GpuResource gpu = new GpuResource(memoryMb);
+            if (reservedGpuMemory.containsKey(id)) {
+                gpu.allocated = true;
+                gpu.availableMemoryMb = 0;
+            }
+            updatedGpus.put(id, gpu);
+        });
+        totalCpu = cpu;
+        totalMem = mem;
+        totalDiskMb = diskMb;
+        availableCpu = cpu - (int) usedCpu;
+        availableMem = mem - (int) usedMem;
+        availableDiskMb = diskMb - usedDisk;
+        gpuResources.clear();
+        gpuResources.putAll(updatedGpus);
+    }
+
+    synchronized void release(int jobId) {
+        Reservation reservation = reservations.remove(jobId);
+        if (reservation == null) {
+            return;
+        }
+        Job job = reservation.job();
+        availableCpu = Math.min(totalCpu, availableCpu + job.getCpuRequested());
+        availableMem = Math.min(totalMem, availableMem + job.getMemRequested());
+        availableDiskMb = Math.min(totalDiskMb, availableDiskMb + job.getDiskMbRequested());
+        for (String gpuId : reservation.gpuIds()) {
+            GpuResource gpu = gpuResources.get(gpuId);
+            gpu.allocated = false;
+            gpu.availableMemoryMb = gpu.totalMemoryMb;
+        }
+    }
+
+    private List<String> selectGpuDevices(Job job) {
+        if (job.getGpuCountRequested() == 0) {
+            return List.of();
+        }
+        if (job.getGpuCountRequested() > gpuResources.size()) {
+            return null;
+        }
+        List<String> selected = new ArrayList<>(job.getGpuCountRequested());
+        for (Map.Entry<String, GpuResource> entry : gpuResources.entrySet()) {
+            if (!entry.getValue().allocated
+                    && entry.getValue().totalMemoryMb >= job.getGpuMemoryMbPerGpu()) {
+                selected.add(entry.getKey());
+                if (selected.size() == job.getGpuCountRequested()) {
+                    return List.copyOf(selected);
+                }
+            }
+        }
+        return null;
     }
 
     int nodeId()               { return nodeId; }
     int totalCpu()             { return totalCpu; }
     int totalMem()             { return totalMem; }
+    long totalDiskMb()          { return totalDiskMb; }
     synchronized int availableCpu() { return availableCpu; }
     synchronized int availableMem() { return availableMem; }
+    synchronized long availableDiskMb() { return availableDiskMb; }
+    synchronized int totalGpuCount() { return gpuResources.size(); }
+    synchronized int availableGpuCount() {
+        return (int) gpuResources.values().stream()
+                .filter(gpu -> gpu.availableMemoryMb > 0).count();
+    }
+    synchronized long totalGpuMemoryMb() {
+        return gpuResources.values().stream().mapToLong(gpu -> gpu.totalMemoryMb).sum();
+    }
+    synchronized long availableGpuMemoryMb() {
+        return gpuResources.values().stream().mapToLong(gpu -> gpu.availableMemoryMb).sum();
+    }
+
+    private record Reservation(Job job, List<String> gpuIds) {}
+
+    private static final class GpuResource {
+        private final long totalMemoryMb;
+        private long availableMemoryMb;
+        private boolean allocated;
+
+        private GpuResource(long memoryMb) {
+            totalMemoryMb = memoryMb;
+            availableMemoryMb = memoryMb;
+        }
+    }
 }
 
-/** Map value #1: nodeId -> [node, nodeResourceTally, lastHeartBeat] */
+/** Registered worker endpoint and resource tally for a controller-assigned node ID. */
 final class NodeEntry {
     private volatile Node node;
     private final NodeResourceTally tally;
-    private volatile long lastHeartBeatNanos;
+    /** Stable logical identity used by WorkerMembershipManager. */
+    private final String workerUUID;
 
     NodeEntry(Node node, NodeResourceTally tally) {
         this.node=node;
         this.tally=tally;
-        this.lastHeartBeatNanos=System.nanoTime();
+        // Prefer the proto worker_uuid field; fall back to legacy "node-N" scheme.
+        String uuid = node.getWorkerUuid();
+        this.workerUUID = (uuid != null && !uuid.isBlank()) ? uuid : "node-" + node.getId();
     }
 
     Node node()                 { return node; }
     NodeResourceTally tally()   { return tally; }
-    long lastHeartBeatNanos()   { return lastHeartBeatNanos; }
-    int nodeId()                { return node.getId(); }   
+    int nodeId()                { return node.getId(); }
+    /** Stable logical identity for membership tracking. */
+    String workerUUID()         { return workerUUID; }
+    /** Legacy alias kept for backward-compatibility. */
+    String workerId()           { return workerUUID; }
 
-    void beat(NodeState reportedState) {
-        this.node=node.toBuilder().setState(reportedState).build();
-        this.lastHeartBeatNanos=System.nanoTime();
+    Map<String, String> labels() {
+        Map<String, String> labels = new LinkedHashMap<>(node.getLabelsMap());
+        labels.put("hostname", node.getHostname());
+        return Collections.unmodifiableMap(labels);
     }
 
-    void markDown() {
+    synchronized boolean beat(Node reportedNode) {
+        Map<String, String> previousLabels = labels();
+        this.node=node.toBuilder()
+                .setState(reportedNode.getState())
+                .clearLabels()
+                .putAllLabels(reportedNode.getLabelsMap())
+                .build();
+        return !previousLabels.equals(labels());
+    }
+
+    synchronized boolean updateRegistration(Node registeredNode) {
+        if (!workerUUID.equals(registeredNode.getWorkerUuid())
+                || registeredNode.getId() != nodeId()) {
+            throw new IllegalArgumentException("Worker registration identity changed");
+        }
+        tally.reconfigure(registeredNode.getCpu(), registeredNode.getMem(),
+                registeredNode.getDiskMb(), registeredNode.getGpuDevicesList());
+        Map<String, String> previousLabels = labels();
+        node = registeredNode.toBuilder().setState(NodeState.AVAILABLE).build();
+        return !previousLabels.equals(labels());
+    }
+
+    synchronized void markDown() {
         this.node=node.toBuilder().setState(NodeState.DOWN).build();
     }
 }
@@ -110,21 +309,39 @@ final class JobEntry {
         return false;
     }
 
-    synchronized boolean beginAllocation() {
+    synchronized boolean beginAllocation(NodeEntry target) {
         if (job.getState()!=JobState.PENDING || node!=null || dispatching) return false;
+        if (target == null) {
+            throw new IllegalArgumentException("Allocation target must not be null");
+        }
+        node=target;
         dispatching=true;
         return true;
     }
 
-    synchronized boolean finishAllocation(NodeEntry node, int allocationId, boolean successful) {
+    synchronized void abortAllocation() {
+        if (dispatching && job.getState() == JobState.PENDING) {
+            node = null;
+            dispatching = false;
+            notifyAll();
+        }
+    }
+
+    synchronized boolean finishAllocation(
+            NodeEntry node, int allocationId, boolean successful, Job allocatedJob) {
         boolean failed=false;
         if (successful) {
             this.node=node;
             this.allocationId=allocationId;
-            if (job.getState()==JobState.PENDING) {
-                job=job.toBuilder().setState(JobState.ALLOCATED).build();
-            }
+            job=job.toBuilder()
+                    .setAssignedWorkerId(allocatedJob.getAssignedWorkerId())
+                    .clearAssignedWorkerLabels()
+                    .putAllAssignedWorkerLabels(allocatedJob.getAssignedWorkerLabelsMap())
+                    .setState(job.getState() == JobState.PENDING
+                            ? JobState.ALLOCATED : job.getState())
+                    .build();
         } else if (job.getState()==JobState.PENDING) {
+            node=null;
             job=job.toBuilder().setState(JobState.FAILED).build();
             failed=true;
         }
@@ -160,11 +377,11 @@ final class JobEntry {
                 || state==JobState.CANCELLED || state==JobState.LOST;
     }
 
-    /** Gives CPU/mem back to the node exactly once, however many times it is called. */
+    /** Gives the job's complete reservation back exactly once. */
     void releaseResources() {
         NodeEntry allocatedNode=node;
         if (allocatedNode!=null && resourcesReleased.compareAndSet(false, true)) {
-            allocatedNode.tally().release(job.getCpuRequested(), job.getMemRequested());
+            allocatedNode.tally().release(job.getId());
         }
     }
 }
@@ -178,11 +395,36 @@ public class Discover implements RestApiServer.JobOperations {
     static final DAGManager dagManager=new DAGManager(jobManager);
     private static final JobParserRegistry jobParserRegistry=new JobParserRegistry();
 
+    static final WorkerMembershipManager membershipManager = new WorkerMembershipManager(SystemTimeSource.INSTANCE);
+    static final FailureDetector failureDetector = new FailureDetector(
+            membershipManager, FailureDetectorConfig.fromSystemProperties(), SystemTimeSource.INSTANCE);
+    private static final Object workerRegistrationLock = new Object();
+
     static {
         jobManager.addJobEventListener(dagManager);
+        membershipManager.addListener(new WorkerFailureListener() {
+            @Override
+            public void onWorkerDown(String workerUUID) {
+                com.JobController.worker.WorkerMembership membership =
+                        membershipManager.getWorker(workerUUID);
+                if (membership != null
+                        && membership.state()
+                                == com.JobController.worker.WorkerMembershipState.DOWN) {
+                    nodes.values().stream()
+                            .filter(entry -> entry.workerUUID().equals(workerUUID))
+                            .forEach(NodeEntry::markDown);
+                }
+                jobManager.onWorkerDown(workerUUID);
+            }
+
+            @Override
+            public void onWorkerRecovered(String workerUUID) {
+                jobManager.onWorkerRecovered(workerUUID);
+            }
+        });
     }
 
-    // nodeId -> [node, nodeResourceTally, lastHeartBeat]
+    // nodeId -> worker endpoint and resource tally.
     static final ConcurrentHashMap<Integer, NodeEntry> nodes=new ConcurrentHashMap<>();
 
     // jobId -> [job, node it is allocated on, ...]
@@ -190,16 +432,19 @@ public class Discover implements RestApiServer.JobOperations {
 
     @Override
     public Optional<Job> submitJob(String owner, String description, int cpuRequested,
-                                  int memRequested) {
-        return jobManager.submitJob(owner, description, cpuRequested, memRequested);
+                                  int memRequested, long diskMbRequested,
+                                  int gpuCountRequested, long gpuMemoryMbPerGpu,
+                                  List<com.JobController.PlacementConstraint> constraints) {
+        return jobManager.submitJob(owner, description, cpuRequested, memRequested,
+                diskMbRequested, gpuCountRequested, gpuMemoryMbPerGpu, constraints);
     }
 
     @Override
     public RestApiServer.DAGSubmission submitDAG(
-            String name, List<CustomDAGTaskSpecification> tasks) {
+            String name, List<CustomDAGTaskSpecification> tasks, Long dagTimeoutMillis) {
         String dagId="custom-dag-" + UUID.randomUUID();
         CustomDAGJobSpecification specification =
-                new CustomDAGJobSpecification(dagId, name, tasks);
+                new CustomDAGJobSpecification(dagId, name, tasks, dagTimeoutMillis);
         DAG dag=jobParserRegistry.parse(specification);
         dagManager.registerDAG(dag);
         DAGRun run=dagManager.startRun(dag.getId());
@@ -210,6 +455,23 @@ public class Discover implements RestApiServer.JobOperations {
     public Optional<RestApiServer.DAGSubmission> findDAGRun(String runId) {
         return dagManager.findRun(runId).flatMap(run -> dagManager.findDAG(run.getDagId())
                 .map(dag -> new RestApiServer.DAGSubmission(dag, run)));
+    }
+
+    @Override
+    public Optional<RestApiServer.DAGCancellation> cancelDAGRun(String dagId, String runId) {
+        Optional<DAGRun> run=dagManager.findRun(runId);
+        if (run.isEmpty() || !run.get().getDagId().equals(dagId)) {
+            return Optional.empty();
+        }
+        boolean cancellationConfirmed;
+        if (run.get().getState() == DAGRunState.RUNNING
+                || run.get().getState() == DAGRunState.CANCELLED) {
+            cancellationConfirmed = dagManager.cancelRun(runId);
+        } else {
+            cancellationConfirmed = true;
+        }
+        return dagManager.findDAG(dagId).map(dag -> new RestApiServer.DAGCancellation(
+                new RestApiServer.DAGSubmission(dag, run.get()), cancellationConfirmed));
     }
 
     @Override
@@ -224,160 +486,17 @@ public class Discover implements RestApiServer.JobOperations {
 
     @Override
     public RestApiServer.CancellationResult cancelJob(int id) {
-        JobEntry entry=jobs.get(id);
-        if (entry==null) {
-            return new RestApiServer.CancellationResult(
-                    RestApiServer.CancellationOutcome.NOT_FOUND, null);
-        }
-
-        try {
-            if (!entry.awaitAllocation(5_500)) {
-                return new RestApiServer.CancellationResult(
-                        RestApiServer.CancellationOutcome.UNAVAILABLE, entry.job());
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return new RestApiServer.CancellationResult(
-                    RestApiServer.CancellationOutcome.UNAVAILABLE, entry.job());
-        }
-
-        Job current=entry.job();
-        if (current.getState()==JobState.CANCELLED) {
-            return new RestApiServer.CancellationResult(
-                    RestApiServer.CancellationOutcome.ALREADY_CANCELLED, current);
-        }
-        if (current.getState()==JobState.COMPLETED || current.getState()==JobState.FAILED
-                || current.getState()==JobState.LOST) {
-            return new RestApiServer.CancellationResult(
-                    RestApiServer.CancellationOutcome.NOT_CANCELLABLE, current);
-        }
-
-        if (entry.cancelIfQueued()) {
-            jobManager.removeQueuedJob(id);
-            jobManager.publishTerminalJobEvent(entry.job());
-            return new RestApiServer.CancellationResult(
-                    RestApiServer.CancellationOutcome.CANCELLED, entry.job());
-        }
-
-        if (entry.node()==null) {
-            return new RestApiServer.CancellationResult(
-                    RestApiServer.CancellationOutcome.UNAVAILABLE, entry.job());
-        }
-
-        try {
-            WorkerClientRegistry.WorkerClient client=workers.getOrConnect(
-                    entry.node().nodeId(), entry.node().node().getAgentEndpoint());
-            Cnf reply=client.stub()
-                    .withDeadlineAfter(5, TimeUnit.SECONDS)
-                    .cancelAllocated(JobRef.newBuilder().setId(id).build());
-            if (!reply.getSuccess()) {
-                System.err.println("Worker rejected cancellation for job " + id + ": "
-                        + reply.getMessage());
-                return refreshCancellationState(id, entry);
-            }
-            if (!entry.tryCancel()) {
-                Job latest=entry.job();
-                System.err.println("Job " + id + " changed state during cancellation to "
-                        + latest.getState());
-                RestApiServer.CancellationOutcome outcome =
-                        latest.getState()==JobState.CANCELLED
-                                ? RestApiServer.CancellationOutcome.ALREADY_CANCELLED
-                                : latest.getState()==JobState.COMPLETED
-                                        || latest.getState()==JobState.FAILED
-                                        || latest.getState()==JobState.LOST
-                                        ? RestApiServer.CancellationOutcome.NOT_CANCELLABLE
-                                        : RestApiServer.CancellationOutcome.UNAVAILABLE;
-                return new RestApiServer.CancellationResult(outcome, latest);
-            }
-            entry.releaseResources();
-            dispatchQueuedJobs();
-            jobManager.publishTerminalJobEvent(entry.job());
-            return new RestApiServer.CancellationResult(
-                    RestApiServer.CancellationOutcome.CANCELLED, entry.job());
-        } catch (RuntimeException e) {
-            System.err.println("Cancel failed for job " + id + ": " + e.getMessage());
-            return refreshCancellationState(id, entry);
-        }
-    }
-
-    private static RestApiServer.CancellationResult refreshCancellationState(int id, JobEntry entry) {
-        try {
-            WorkerClientRegistry.WorkerClient client=workers.getOrConnect(
-                    entry.node().nodeId(), entry.node().node().getAgentEndpoint());
-            Job workerJob=client.stub()
-                    .withDeadlineAfter(5, TimeUnit.SECONDS)
-                    .getJobStatus(Job.newBuilder().setId(id).build());
-            JobState workerState=workerJob.getState();
-            if (workerState==JobState.CANCELLED || workerState==JobState.COMPLETED
-                    || workerState==JobState.FAILED || workerState==JobState.LOST) {
-                boolean transitioned=entry.setState(workerState);
-                entry.releaseResources();
-                if (transitioned) {
-                    jobManager.publishTerminalJobEvent(entry.job());
-                }
-            }
-        } catch (RuntimeException e) {
-            System.err.println("Could not refresh job state after cancellation failure: "
-                    + e.getMessage());
-        }
-
-        Job current=entry.job();
-        RestApiServer.CancellationOutcome outcome =
-                current.getState()==JobState.CANCELLED
-                        ? RestApiServer.CancellationOutcome.ALREADY_CANCELLED
-                        : current.getState()==JobState.COMPLETED
-                                || current.getState()==JobState.FAILED
-                                || current.getState()==JobState.LOST
-                                ? RestApiServer.CancellationOutcome.NOT_CANCELLABLE
-                                : RestApiServer.CancellationOutcome.UNAVAILABLE;
-        return new RestApiServer.CancellationResult(outcome, current);
+        return jobManager.cancelJob(id);
     }
 
     private static Cnf fail(String message) {
         return Cnf.newBuilder().setSuccess(false).setMessage(message).build();
     }
 
-    private static final long HEARTBEAT_INTERVAL_MS=5_000;
-    private static final long HEARTBEAT_TIMEOUT_NS=3 * HEARTBEAT_INTERVAL_MS * 1_000_000L;
-
-    private static final ScheduledExecutorService reaper =
-            Executors.newSingleThreadScheduledExecutor();
-
     static void dispatchQueuedJobs() {
         jobManager.dispatchQueuedJobs();
     }
 
-    static void startFailureDetector() {
-        reaper.scheduleWithFixedDelay(() -> {
-            try {
-                long now=System.nanoTime();
-                for (NodeEntry n : nodes.values()) {
-                    boolean stale=now-n.lastHeartBeatNanos() > HEARTBEAT_TIMEOUT_NS;
-                    if (stale && n.node().getState()!=NodeState.DOWN) {
-                        markNodeDown(n);
-                    }
-                }
-                dispatchQueuedJobs();
-            } catch (RuntimeException e) {
-                e.printStackTrace();   // an uncaught exception would silently cancel future runs
-            }
-        }, 1, 2, TimeUnit.SECONDS);
-    }
-
-    static void markNodeDown(NodeEntry n) {
-       n.markDown();
-       System.out.println("Node " + n.nodeId() + " missed heartbeats; marked DOWN");
-
-       for (JobEntry e : jobs.values()) {
-           if (e.node()==n) {
-               if (e.setState(JobState.LOST)) {
-                   e.releaseResources();
-                   jobManager.publishTerminalJobEvent(e.job());
-                   dispatchQueuedJobs();
-               }
-           }
-       }
-    }
 
     public static class NodeManager extends WorkerToControllerGrpc.WorkerToControllerImplBase {
 
@@ -386,28 +505,77 @@ public class Discover implements RestApiServer.JobOperations {
             if (request.getHostname().isBlank()
                     || request.getAgentEndpoint().isBlank()
                     || request.getCpu()<=0
-                    || request.getMem()<=0) {
-                obs.onNext(fail("hostname, endpoint, CPU, and memory are required"));
+                    || request.getMem()<=0
+                    || request.getDiskMb() < 0) {
+                obs.onNext(fail(
+                        "hostname, endpoint, positive CPU/memory, and non-negative disk are required"));
+                obs.onCompleted();
+                return;
+            }
+            if (request.getLabelsMap().entrySet().stream().anyMatch(entry ->
+                    entry.getKey().isBlank() || entry.getValue().isBlank())) {
+                obs.onNext(fail("Worker label keys and values must not be blank"));
                 obs.onCompleted();
                 return;
             }
 
-            int nodeId=nextNodeId.incrementAndGet();
-            Node node=request.toBuilder()
-                    .setId(nodeId)
-                    .setState(NodeState.AVAILABLE)
-                    .build();
             try {
-                workers.getOrConnect(nodeId, node.getAgentEndpoint());
-                // Published only after the connection succeeded, so no half-registered nodes are visible.
-                nodes.put(nodeId, new NodeEntry(node,
-                        new NodeResourceTally(nodeId, node.getCpu(), node.getMem())));
-                dispatchQueuedJobs();
-                obs.onNext(Cnf.newBuilder().setSuccess(true).setNodeId(nodeId).build());
-                System.out.println("Node " + nodeId + " added");
-            } catch (RuntimeException e) {
-                workers.remove(nodeId);
-                obs.onNext(fail("Could not connect to worker: " + e.getMessage()));
+                new NodeResourceTally(0, request.getCpu(), request.getMem(),
+                        request.getDiskMb(), request.getGpuDevicesList());
+            } catch (IllegalArgumentException e) {
+                obs.onNext(fail(e.getMessage()));
+                obs.onCompleted();
+                return;
+            }
+
+            String workerUuid = request.getWorkerUuid();
+            if (workerUuid == null || workerUuid.isBlank()) {
+                workerUuid = "node-" + (nextNodeId.get() + 1); // Legacy worker identity.
+            } else {
+                try {
+                    UUID.fromString(workerUuid);
+                } catch (IllegalArgumentException e) {
+                    obs.onNext(fail("worker_uuid must be a valid UUID"));
+                    obs.onCompleted();
+                    return;
+                }
+            }
+            final String registeredWorkerUuid = workerUuid;
+            String incarnationId = request.getIncarnationId();
+            if (incarnationId == null || incarnationId.isBlank()) {
+                incarnationId = "legacy-" + System.currentTimeMillis();
+            }
+
+            synchronized (workerRegistrationLock) {
+                NodeEntry existing = nodes.values().stream()
+                        .filter(entry -> entry.workerUUID().equals(registeredWorkerUuid))
+                        .findFirst().orElse(null);
+                int nodeId = existing == null ? nextNodeId.incrementAndGet() : existing.nodeId();
+                Node node=request.toBuilder()
+                        .setId(nodeId)
+                        .setState(NodeState.AVAILABLE)
+                        .setWorkerUuid(workerUuid)
+                        .setIncarnationId(incarnationId)
+                        .build();
+                try {
+                    membershipManager.registerWorker(registeredWorkerUuid, incarnationId);
+                    if (existing == null) {
+                        workers.getOrConnect(nodeId, node.getAgentEndpoint());
+                        nodes.put(nodeId, new NodeEntry(node,
+                                new NodeResourceTally(nodeId, node.getCpu(), node.getMem(),
+                                        node.getDiskMb(), node.getGpuDevicesList())));
+                    } else {
+                        workers.getOrConnect(nodeId, node.getAgentEndpoint());
+                        existing.updateRegistration(node);
+                    }
+                    dispatchQueuedJobs();
+                    obs.onNext(Cnf.newBuilder().setSuccess(true).setNodeId(nodeId).build());
+                } catch (RuntimeException e) {
+                    if (existing == null) {
+                        workers.remove(nodeId);
+                    }
+                    obs.onNext(fail("Could not register worker: " + e.getMessage()));
+                }
             }
             obs.onCompleted();
         }
@@ -417,11 +585,39 @@ public class Discover implements RestApiServer.JobOperations {
             NodeEntry entry=nodes.get(request.getId());
             if (entry==null) {
                 obs.onNext(fail("Unknown node"));
-                System.out.println("Unknown Node Approached");
             } else {
-                entry.beat(request.getState());
-                System.out.println("Heartbeat from node " + request.getId() + " recorded");
+                if (request.getLabelsMap().entrySet().stream().anyMatch(label ->
+                        label.getKey().isBlank() || label.getValue().isBlank())) {
+                    obs.onNext(fail("Worker label keys and values must not be blank"));
+                    obs.onCompleted();
+                    return;
+                }
+
+                String uuid = request.getWorkerUuid();
+                if (uuid == null || uuid.isBlank()) uuid = entry.workerUUID();
+                if (!entry.workerUUID().equals(uuid)) {
+                    obs.onNext(fail("Heartbeat worker UUID does not match registered node"));
+                    obs.onCompleted();
+                    return;
+                }
+                String inc = request.getIncarnationId();
+                if (inc == null || inc.isBlank()) {
+                    inc = entry.node().getIncarnationId();
+                }
+                long seq = request.getHeartbeatSequence();
+
+                boolean accepted = membershipManager.processHeartbeat(uuid, inc, seq);
+                if (!accepted) {
+                    obs.onNext(fail("Stale or duplicate heartbeat"));
+                    obs.onCompleted();
+                    return;
+                }
+
+                boolean labelsChanged = entry.beat(request);
                 obs.onNext(Cnf.newBuilder().setSuccess(true).build());
+                if (labelsChanged) {
+                    dispatchQueuedJobs();
+                }
             }
             obs.onCompleted();
         }
@@ -445,6 +641,10 @@ public class Discover implements RestApiServer.JobOperations {
                     }
                 }
                 default -> { }
+            }
+            if (transitioned && (j.getState()==JobState.ALLOCATED
+                    || j.getState()==JobState.RUNNING)) {
+                jobManager.publishJobStateChanged(entry.job());
             }
 
             obs.onNext(Cnf.newBuilder()
@@ -472,14 +672,14 @@ public class Discover implements RestApiServer.JobOperations {
         String restHost=System.getProperty("clusterforge.rest.host", "127.0.0.1");
         int restPort=Integer.getInteger("clusterforge.rest.port", 8080);
         RestApiServer restServer=new RestApiServer(restHost, restPort, new Discover());
-        startFailureDetector();
-        System.out.println("Reaper Started");
+        failureDetector.start();
         server.start();
         restServer.start();
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             restServer.close();
             server.shutdown();
-            reaper.shutdownNow();
+            failureDetector.shutdown();
+            dagManager.shutdown();
             jobManager.shutdown();
             workers.close();
         }));

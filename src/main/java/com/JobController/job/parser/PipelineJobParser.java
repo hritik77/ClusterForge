@@ -2,6 +2,8 @@ package com.JobController.job.parser;
 
 import com.JobController.dag.DAG;
 import com.JobController.dag.DAGTask;
+import com.JobController.dag.RetryPolicy;
+import com.JobController.dag.TimeoutPolicy;
 import com.JobController.job.JobType;
 import com.JobController.job.spec.JobSpecification;
 import com.JobController.job.spec.PipelineJobSpecification;
@@ -46,8 +48,14 @@ public final class PipelineJobParser implements JobParser {
                     task.getId(),
                     task.getCpu(),
                     task.getMemory(),
+                    task.getDiskMb(),
+                    task.getGpuCount(),
+                    task.getGpuMemoryMbPerGpu(),
                     task.getDependencies(),
-                    task.getCommand()));
+                    task.getCommand(),
+                    new RetryPolicy(0),
+                    new TimeoutPolicy(null),
+                    task.getPlacementRequirements()));
         }
         return dag;
     }

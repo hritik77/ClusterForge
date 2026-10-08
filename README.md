@@ -46,16 +46,18 @@ The controller process (`com.JobController.Discover`) hosts two services:
 
 The controller maintains these in-memory structures:
 
-- A node registry with each worker's advertised endpoint, reported state, and total/available CPU and memory.
+- A node registry with each worker's advertised endpoint, reported state, and total/available CPU, memory, disk, and GPU-device capacity.
 - A job registry with job data, allocation state, and the node to which an allocated job was assigned.
 - A bounded FIFO queue of pending job IDs.
 - A cache of gRPC client channels to workers.
 
 A single-threaded dispatcher drains the pending queue. It is triggered by new submissions, worker registration, heartbeats, and resource release after terminal job status or cancellation.
 
+Worker health is tracked separately from resource allocation. A worker has a stable UUID, a process incarnation, and monotonically sequenced heartbeats. The controller moves workers from `AVAILABLE` to `SUSPECTED` after the configured suspicion timeout, then to `DOWN` after the longer down timeout. Suspected workers receive no new jobs, but their existing jobs are not declared lost until the worker is down. A valid heartbeat or re-registration can restore membership; jobs already declared lost are not resurrected.
+
 ### Worker
 
-Each worker (`com.Worker.Worker`) starts a gRPC server, registers itself with the controller, and sends a heartbeat every five seconds. The worker maintains an in-memory map of job records. On allocation it records the job as `ALLOCATED`; on cancellation it marks the job `CANCELLED`; it can also return the current job status to the controller.
+Each worker (`com.Worker.Worker`) starts a gRPC server, registers its configured CPU, memory, disk, and GPU-device inventory with the controller, and sends a heartbeat every five seconds. The worker maintains an in-memory map of job records. On allocation it validates the selected GPU device IDs and records the job as `ALLOCATED`; on cancellation it marks the job `CANCELLED`; it can also return the current job status to the controller.
 
 There is no worker-side command or container launch in the current implementation. A `RUNNING` or `COMPLETED` state therefore requires a future execution integration or another status-reporting mechanism.
 
@@ -80,7 +82,7 @@ At run creation, root tasks begin `READY` and dependent tasks begin `BLOCKED`. R
 
 DAG runs are printed to the controller console as an ASCII adjacency view when task jobs are submitted and when task states change. Each task line shows its state and, once submitted, its ClusterForge job ID; outgoing arrows show dependent tasks. A job submitted through `POST /api/jobs` has no dependency information, so the controller displays it accurately as a standalone, one-node DAG rather than inventing edges.
 
-DAG and run state is in memory. `POST /api/dags` accepts an explicit `CUSTOM_DAG` JSON specification, validates it, starts the run, and returns the graph, task states, and job IDs. `GET /api/dags/runs/{runId}` returns the current in-memory run view. There is no DAG cancellation endpoint. Job status events use the existing controller/worker protocol; workers are not DAG-aware and still do not launch workloads by themselves.
+DAG and run state is in memory. `POST /api/dags` accepts an explicit `CUSTOM_DAG` JSON specification, validates it, starts the run, and returns the graph, task states, and job IDs. `GET /api/dags/runs/{runId}` returns the current in-memory run view. `DELETE /api/dags/{dagId}/runs/{runId}` cancels a running DAG and returns its updated state. Job status events use the existing controller/worker protocol; workers are not DAG-aware and still do not launch workloads by themselves.
 
 ### BATCH DAG parsing
 
@@ -98,9 +100,69 @@ The `CUSTOM_DAG` parser maps each explicitly specified task directly into the DA
 
 Each `DAGTask` has a `RetryPolicy`; existing constructors default to zero retries. `maxRetries` counts attempts after the first, and each retry creates a new ClusterForge job ID through the regular submission queue. Retry counts are stored per task in each `DAGRun`. Explicit job failures and worker-loss (`LOST`) events are retried according to the task policy. When retries are exhausted, the task and DAG run fail; no new dependent tasks are submitted, while already-submitted independent tasks are allowed to report their terminal state. Worker-loss handling releases the previous worker's resource reservation before notifying DAG listeners and submitting retries.
 
+### Resource requests
+
+Standalone jobs and DAG tasks can request CPU, memory, disk, GPUs, and GPU memory. The existing CPU and `memory` values remain positive integer capacity units and must match the worker's declarations. DAG tasks use `diskMb`; standalone jobs use `diskMbRequested`. Both use `gpuMemoryMbPerGpu` for the per-device VRAM minimum, in integer MB. Disk and GPU count requests are optional and default to zero, preserving existing submissions.
+
+GPU memory is a **per-device minimum**: for example, `gpuCount: 2` and `gpuMemoryMbPerGpu: 8192` requests two separate GPU devices, each with at least 8192 MB of memory. GPU devices are allocated exclusively to one job at a time; the controller selects device IDs deterministically from each worker's declared inventory and sends those IDs with the allocation. The worker validates that the IDs exist and meet the request. Disk is accounted as a reservation against the worker's configured capacity while a job is allocated; it is not a live filesystem quota, and neither GPU nor disk resource values are auto-detected.
+
+Custom DAG task fields (all additional resource fields are optional):
+
+```json
+{
+  "id": "train",
+  "command": "python train.py",
+  "cpu": 8,
+  "memory": 16,
+  "diskMb": 20480,
+  "gpuCount": 1,
+  "gpuMemoryMbPerGpu": 12288,
+  "dependsOn": []
+}
+```
+
+Standalone `POST /api/jobs` uses `diskMbRequested`, `gpuCountRequested`, and `gpuMemoryMbPerGpu` alongside `cpuRequested` and `memRequested`.
+
+The schedulers first exclude workers that cannot fit the complete request. The active `LeastLoadedSchedular` scores eligible workers using CPU, memory, disk, GPU count, and GPU-memory utilization and demand. The First Fit, Best Fit, and Round Robin selections remain comparison-only log output; they do not allocate or reserve resources.
+
+### DAG cancellation and timeouts
+
+`DAG` supports an optional workflow `timeoutMillis`, and each `DAGTask` supports an optional timeout policy in milliseconds. The workflow timer starts when the run is created; a task timer starts only when the controller receives a `RUNNING` status for that task (not when it is ready, queued, or allocated). Task timeouts cancel the current ClusterForge job and follow the task retry policy, using a new job ID for every retry. A workflow timeout fails the run, cancels its nonterminal tasks, and never retries them. An explicit cancellation marks every nonterminal task `CANCELLED` and never retries it. Both paths prevent downstream submissions. Completed tasks remain completed, and a terminal run cannot be reopened.
+
+The controller uses one daemon scheduled executor for DAG/task timeout callbacks. Completion, cancellation, and timeout processing is serialized by `DAGManager`; stale callbacks and events from older job attempts cannot change the current task state. Job cancellation is routed through `JobManager` and the existing worker `cancelAllocated` RPC; controller reservations are released idempotently.
+
+Example timeout fields in a `CUSTOM_DAG` submission:
+
+```json
+{
+  "jobType": "CUSTOM_DAG",
+  "name": "timed-workflow",
+  "timeoutMillis": 300000,
+  "tasks": [
+    {
+      "id": "preprocess",
+      "command": "python preprocess.py",
+      "cpu": 2,
+      "memory": 4,
+      "timeoutMillis": 30000,
+      "dependsOn": []
+    }
+  ]
+}
+```
+
+Timeout values must be positive integer milliseconds. Omit a timeout or set it to JSON `null` to disable it. Run responses include workflow/task timeout configuration, start/deadline timestamps, and recorded timeout/cancellation reasons. A cancellation response also reports `cancellationConfirmed`. Cancel a run using the returned DAG and run IDs:
+
+```sh
+curl -i -X DELETE \
+  "http://127.0.0.1:8080/api/dags/<dagId>/runs/<runId>"
+```
+
+The endpoint returns `200 OK` and the current run representation when cancellation is confirmed. It returns `503 Service Unavailable` if one or more underlying jobs could not be confirmed cancelled. A completed, failed, or already-cancelled run remains in its terminal state.
+
 ### Submit and inspect an explicit DAG
 
-Use `POST /api/dags` to submit a custom DAG. The controller assigns a unique DAG ID and run ID; callers provide `jobType`, `name`, and `tasks`. Each task requires an `id`, `command`, positive integer `cpu` and `memory`, and an optional `dependsOn` string array (omit it or use `[]` for a root). The entire graph is validated before registration or job submission.
+Use `POST /api/dags` to submit a custom DAG. The controller assigns a unique DAG ID and run ID; callers provide `jobType`, `name`, and `tasks`. Each task requires an `id`, `command`, positive integer `cpu` and `memory`, and an optional `dependsOn` string array (omit it or use `[]` for a root). Optional `diskMb`, `gpuCount`, and `gpuMemoryMbPerGpu` fields request disk and GPU resources. `placementConstraints` may be supplied per task using the same format as standalone jobs. `timeoutMillis` is optional on the DAG and on each task. The entire graph, resource requests, placement constraints, and timeout values are validated before registration or job submission.
 
 ```sh
 curl -i http://127.0.0.1:8080/api/dags \
@@ -111,14 +173,16 @@ curl -i http://127.0.0.1:8080/api/dags \
     "tasks": [
       {"id":"download","command":"python download.py","cpu":2,"memory":4,"dependsOn":[]},
       {"id":"clean","command":"python clean.py","cpu":2,"memory":4,"dependsOn":["download"]},
-      {"id":"train","command":"python train.py","cpu":8,"memory":16,"dependsOn":["clean"]},
+      {"id":"train","command":"python train.py","cpu":8,"memory":16,
+       "placementConstraints":[{"key":"accelerator","operator":"EQUALS","value":"nvidia"}],
+       "dependsOn":["clean"]},
       {"id":"test","command":"python test.py","cpu":4,"memory":8,"dependsOn":["clean"]},
       {"id":"deploy","command":"python deploy.py","cpu":2,"memory":4,"dependsOn":["train","test"]}
     ]
   }'
 ```
 
-The `202 Accepted` response contains a `graph` string and a `tasks` array with dependencies, state, command, resources, and assigned `jobId` values. Save `runId` from the response and inspect it as tasks progress:
+The `202 Accepted` response contains a `graph` string and a `tasks` array with dependencies, placement constraints, state, command, resources, and assigned `jobId` values. Each task also contains an `attempts` array and a `currentAttempt` number (or `null` if it has not been submitted). Attempt entries are immutable snapshots with a zero-based attempt number, job ID, lifecycle state, timestamps, worker ID and label snapshot when allocated, and failure reason/message when applicable. A retry creates a new attempt entry with a fresh job ID; earlier attempt entries remain unchanged in the response view. Save `runId` from the response and inspect it as tasks progress:
 
 ```sh
 RUN_ID='paste-the-runId-from-the-submit-response'
@@ -152,12 +216,12 @@ If a worker stops sending heartbeats, the controller marks its node `DOWN` after
 
 | State | Scheduling behavior |
 | --- | --- |
-| `AVAILABLE` | Eligible when the worker has enough available CPU and memory. |
+| `AVAILABLE` | Eligible when the worker has enough available capacity for every requested resource. |
 | `NODE_ALLOCATED` | Not excluded by the scheduler; actual eligibility is based on state and remaining resources. |
 | `MAINTENANCE` | Excluded from placement. |
 | `DOWN` | Excluded from placement. |
 
-For placement, a node must not be `DOWN` or `MAINTENANCE`, and must have at least the requested CPU **and** memory available.
+For placement, a node must not be `DOWN` or `MAINTENANCE`, and must have enough CPU, memory, disk, GPU devices, and per-device GPU memory for the complete request.
 
 ## Scheduling and allocation
 
@@ -169,13 +233,19 @@ Only `LeastLoadedSchedular` chooses the worker used for a real allocation. For e
 score =
     usedCPU / totalCPU
   + usedMemory / totalMemory
+  + usedDisk / totalDisk
+  + usedGPUDevices / totalGPUDevices
+  + usedGPUMemory / totalGPUMemory
   + requestedCPU / totalCPU
   + requestedMemory / totalMemory
+  + requestedDisk / totalDisk
+  + requestedGPUDevices / totalGPUDevices
+  + requestedGPUMemory / totalGPUMemory
 ```
 
-The eligible node with the smallest score wins. Ties are resolved by ascending node ID. Resource availability is checked before scoring, so the selected node can satisfy both requested dimensions.
+Terms for unconfigured resources are zero. The eligible node with the smallest score wins. Ties are resolved by ascending node ID. Resource availability is checked before scoring, including the requirement that every requested GPU has the requested per-device memory.
 
-After selecting a node, the controller atomically reserves CPU and memory in its node tally, sends an allocation RPC, and marks the job `ALLOCATED` after the worker confirms success. If the worker rejects the request or the RPC fails, the controller releases the reservation and marks the job `FAILED`.
+After selecting a node, the controller atomically reserves CPU, memory, disk, and the selected GPU devices in its node tally, sends an allocation RPC, and marks the job `ALLOCATED` after the worker confirms success. If the worker rejects the request or the RPC fails, the controller releases the complete reservation and marks the job `FAILED`.
 
 ### Comparison-only policies
 
@@ -184,7 +254,7 @@ For an allocation attempt where Least Loaded finds an eligible node, the control
 | Policy | Choice |
 | --- | --- |
 | First Fit | First eligible node in ascending node-ID order. |
-| Best Fit | Eligible node minimizing the sum of normalized CPU and memory remaining after this job is placed. Node ID breaks ties. |
+| Best Fit | Eligible node minimizing the sum of normalized remaining capacity for resources requested by this job. Node ID breaks ties. |
 | Round Robin | Next eligible node in ascending node-ID order after the last node selected by this comparison scheduler; wraps to the first eligible node. |
 
 These are **comparison results only**. Their selected nodes do not receive allocations and their choices do not affect the active Least Loaded policy. The Round Robin comparison cursor is advanced when it is evaluated, not only when a job ultimately succeeds.
@@ -196,6 +266,39 @@ Scheduling comparison for job 42: LeastLoaded=node 2, FirstFit=1, BestFit=2, Rou
 ```
 
 `none` means that a comparison policy found no eligible node. These logs are currently emitted to standard output and are not persisted as structured data.
+
+### Worker labels and placement constraints
+
+Workers may advertise qualitative labels in addition to their quantitative CPU, memory, disk, and GPU inventory. Configure custom labels with the worker property `clusterforge.worker.labels`, using comma-separated `key=value` pairs. The worker advertises its configured labels at registration and refreshes them with each heartbeat. `hostname` is added automatically from `clusterforge.worker.hostname` and cannot be overridden.
+
+For example, start a worker with:
+
+```sh
+java -Dclusterforge.worker.hostname=gpu-east-1 \
+  -Dclusterforge.worker.labels=region=east,accelerator=nvidia \
+  -cp "target/Architect-1.0-SNAPSHOT.jar:$(cat target/dependency-classpath.txt)" \
+  com.Worker.Worker
+```
+
+A job can require one or more label matches using `placementConstraints`. Every constraint must match for a worker to be eligible:
+
+```json
+{
+  "key": "region",
+  "operator": "EQUALS",
+  "value": "east"
+}
+```
+
+`EQUALS` requires the exact label value; `NOT_EQUALS` requires the label to exist and have a different value. A missing label does not satisfy either operator. Placement requirements are preserved across DAG retries. They filter candidates before the existing Least Loaded resource selection; placement does not reserve or account for qualitative labels as a resource.
+
+### Worker membership and failure detection
+
+`GET /api/workers` returns the controller's membership view, including each worker UUID, membership state, registration and heartbeat times, missed-heartbeat count, current incarnation, and heartbeat sequence. Membership health and resource availability are separate: a healthy worker can be out of capacity, while a suspected worker is excluded from new allocations even if it has free resources.
+
+Failure detection uses controller-observed heartbeat arrival time, not the worker's wall clock. Timeout checks use a single scheduled sweep and re-check the current heartbeat while committing each state transition, so delayed or duplicate heartbeats do not reset liveness and a concurrent accepted heartbeat cannot be overwritten by an old timeout observation. Failure detection is necessarily approximate under scheduler delays, GC pauses, and network latency; `SUSPECTED` is intentionally reversible and does not fail jobs.
+
+On a `DOWN` transition, the controller marks active jobs assigned to that worker `LOST`, releases their reservations once, and publishes the existing lost-job event. The DAG manager then applies the task's existing retry policy. A returning worker keeps the same UUID and receives a newer incarnation; old job attempts remain lost and are not restarted.
 
 ### Queue behavior
 
@@ -299,9 +402,28 @@ All settings are Java system properties supplied with `-Dname=value` before the 
 | `clusterforge.worker.hostname` | Worker | `localhost` | Human-readable worker name registered with the controller. |
 | `clusterforge.worker.cpu` | Worker | `8` | CPU capacity declared by the worker; must be positive. |
 | `clusterforge.worker.mem` | Worker | `16` | Memory capacity declared by the worker; must be positive. |
+| `clusterforge.worker.disk-mb` | Worker | `0` | Disk capacity declared by the worker in MB; must be non-negative. |
+| `clusterforge.worker.gpus` | Worker | empty | Comma-separated `deviceId:memoryMb` inventory, for example `GPU-0:8192,GPU-1:24576`. Device IDs must be unique and memory capacities positive. |
+| `clusterforge.worker.labels` | Worker | empty | Comma-separated custom `key=value` labels, for example `region=east,accelerator=nvidia`; `hostname` is reserved and advertised automatically. |
+| `clusterforge.worker.identity-file` | Worker | `.worker_uuid` | Path to the worker's persistent UUID file. The adjacent `.incarnation` file stores a monotonically increasing process incarnation. Keep both files with the worker to preserve its identity across restarts. |
+| `clusterforge.failure-detector.heartbeat-interval-ms` | Controller and worker | `5000` | Expected worker heartbeat interval. The worker uses this interval when sending heartbeats. |
+| `clusterforge.failure-detector.suspect-timeout-ms` | Controller | `15000` | Elapsed time without an accepted heartbeat before a worker becomes `SUSPECTED`; must exceed the heartbeat interval. |
+| `clusterforge.failure-detector.down-timeout-ms` | Controller | `30000` | Elapsed time without an accepted heartbeat before a suspected worker becomes `DOWN`; must exceed the suspect timeout. |
+| `clusterforge.failure-detector.check-interval-ms` | Controller | `1000` | Delay between failure-detector sweeps; must be positive. |
 | `clusterforge.queue.capacity` | Controller | `10000` | Maximum number of jobs waiting in the pending queue; must be positive. |
 
 CPU and memory values are integer capacity units. The project treats them as abstract, consistent units: request values and worker declarations must use the same units. No conversion to cores, bytes, or another physical measure is performed.
+
+Example worker configuration for declared disk and two GPUs:
+
+```sh
+java -Dclusterforge.worker.disk-mb=1048576 \
+  -Dclusterforge.worker.gpus=GPU-0:8192,GPU-1:24576 \
+  -cp "target/Architect-1.0-SNAPSHOT.jar:$(cat target/dependency-classpath.txt)" \
+  com.Worker.Worker
+```
+
+If `clusterforge.worker.gpus` is omitted, that worker reports no GPUs. Inventory is configured manually rather than detected from the host.
 
 ## REST API
 
@@ -321,11 +443,18 @@ Example:
   "owner": "alice",
   "description": "nightly batch",
   "cpuRequested": 2,
-  "memRequested": 4
+  "memRequested": 4,
+  "diskMbRequested": 1024,
+  "gpuCountRequested": 1,
+  "gpuMemoryMbPerGpu": 8192,
+  "placementConstraints": [
+    {"key":"region","operator":"EQUALS","value":"east"},
+    {"key":"accelerator","operator":"NOT_EQUALS","value":"cpu-only"}
+  ]
 }
 ```
 
-`owner` and `description` must be non-blank. `cpuRequested` and `memRequested` must both be positive. Do not provide `id` or a non-default `state`; the controller assigns the ID and initializes the job as `PENDING`.
+`owner` and `description` must be non-blank. `cpuRequested` and `memRequested` must both be positive. Disk and GPU requests must be non-negative; GPU memory can only be requested when `gpuCountRequested` is positive. `placementConstraints` is optional; when present it is a list of non-blank `key`, `operator`, and `value` objects, with `operator` set to `EQUALS` or `NOT_EQUALS`. All entries are required to match, and workers missing a requested label are ineligible. Do not provide `id` or a non-default `state`; the controller assigns the ID and initializes the job as `PENDING`.
 
 On acceptance, the response is `202 Accepted`, includes `Location: /api/jobs/{id}`, and contains the job JSON. Acceptance means the job was put in the in-memory queue; it does not mean that a worker has already accepted or begun the job.
 
@@ -373,7 +502,7 @@ Errors are JSON objects with an `error` string:
 | `405 Method Not Allowed` | Method not supported by the selected route. The `Allow` header lists permitted methods. |
 | `413 Payload Too Large` | Request body exceeds 1 MiB. |
 | `415 Unsupported Media Type` | Submission does not use `Content-Type: application/json`. |
-| `503 Service Unavailable` | Queue is full or worker cancellation is unavailable. |
+| `503 Service Unavailable` | Queue is full, worker cancellation is unavailable, or DAG cancellation could not be confirmed. |
 
 ## gRPC protocol
 
@@ -383,15 +512,15 @@ The protobuf and service definitions are in `src/main/proto/Broker.proto`. Maven
 
 | RPC | Purpose |
 | --- | --- |
-| `registerNode(Node)` | Worker announces hostname, gRPC endpoint, and CPU/memory capacity. The controller assigns a node ID. |
+| `registerNode(Node)` | Worker announces hostname, gRPC endpoint, CPU/memory/disk capacity, and its GPU devices with per-device memory. The controller assigns a node ID. |
 | `heartBeat(Node)` | Worker refreshes liveness and reports its node state. Workers send these approximately every five seconds. |
-| `reportJobStatus(Job)` | Worker reports a job-state update. Terminal reports release the controller's CPU and memory reservation and trigger another queue pass. |
+| `reportJobStatus(Job)` | Worker reports a job-state update. Terminal reports release the controller's resource reservation and trigger another queue pass. |
 
 ### Controller-to-worker service
 
 | RPC | Purpose |
 | --- | --- |
-| `allocate(AllocationCommand)` | Controller sends the job and an allocation ID. The worker records the job and responds with success/failure. |
+| `allocate(AllocationCommand)` | Controller sends the job, allocation ID, and selected GPU device IDs. The worker validates the requested capacity and device IDs, records the job, and responds with success/failure. |
 | `cancelAllocated(JobRef)` | Controller asks the worker to cancel a previously allocated job. Cancellation is idempotent for jobs already cancelled. |
 | `getJobStatus(Job)` | Controller queries the worker's current record for a job, primarily to reconcile a failed cancellation request. |
 
@@ -401,7 +530,7 @@ The gRPC channels use plaintext transport in the current implementation. Do not 
 
 - **Worker does not register:** verify that the controller gRPC port is reachable from the worker and that `clusterforge.controller.host` and `clusterforge.controller.port` are correct.
 - **Controller cannot allocate to a worker:** verify that the advertised `clusterforge.worker.host:clusterforge.worker.port` is reachable from the controller. A worker may be able to connect outbound to the controller even when its advertised inbound address is incorrect.
-- **Job remains `PENDING`:** verify that at least one worker is registered, not `DOWN` or `MAINTENANCE`, and has enough available CPU and memory for the job. Pending jobs are retried on dispatch triggers; jobs that do not fit are retained.
+- **Job remains `PENDING`:** verify that at least one worker is registered, not `DOWN` or `MAINTENANCE`, and has enough available CPU, memory, disk, and matching GPU devices for the job. Pending jobs are retried on dispatch triggers; jobs that do not fit are retained.
 - **Job becomes `FAILED` during allocation:** inspect controller output and worker logs for the allocation error. An allocation RPC error or worker rejection fails the job; a DAG task retries according to its policy, while a standalone job is not automatically resubmitted.
 - **Node marked `DOWN`:** check worker liveness, network connectivity, and heartbeat logs. The controller uses a roughly 15-second heartbeat timeout.
 - **Scheduler comparison output:** each successful allocation prints the active Least Loaded node and comparison-only First Fit, Best Fit, and Round Robin nodes. These lines are for observing policy differences; only Least Loaded controls allocation.
@@ -445,4 +574,4 @@ src/main/proto/
 - **No workload execution:** workers currently record allocations and expose status/cancellation RPCs; they do not launch a process or container.
 - **No authentication or encryption:** REST has no built-in authentication or TLS. gRPC channels are plaintext. Bind REST to loopback for local use, restrict service ports to trusted networks, and use a properly authenticated TLS-terminating proxy if REST must be accessed remotely.
 - **Controller availability:** the controller is a single point of failure and owns the authoritative in-memory view of resources and jobs.
-- **Resource accounting:** reservations are based on declared integer CPU and memory units, not live OS utilization. Capacity changes on a running worker are not dynamically discovered.
+- **Resource accounting:** reservations use declared CPU/memory units and configured disk/GPU inventory, not live OS utilization. Disk use is not enforced as a filesystem quota, and capacity changes on a running worker are not dynamically discovered.

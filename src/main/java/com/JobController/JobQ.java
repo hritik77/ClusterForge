@@ -18,8 +18,8 @@ final class JobQ {
         return true;
     }
 
-    synchronized void remove(int jobId) {
-        queuedJobIds.remove(jobId);
+    synchronized boolean remove(long jobId) {
+        return queuedJobIds.removeIf(queuedId -> queuedId.longValue() == jobId);
     }
 
     synchronized List<Integer> snapshot() {

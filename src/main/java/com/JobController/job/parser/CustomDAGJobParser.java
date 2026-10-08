@@ -3,6 +3,8 @@ package com.JobController.job.parser;
 import com.JobController.dag.DAG;
 import com.JobController.dag.DAGTask;
 import com.JobController.dag.DAGValidator;
+import com.JobController.dag.RetryPolicy;
+import com.JobController.dag.TimeoutPolicy;
 import com.JobController.job.JobType;
 import com.JobController.job.spec.CustomDAGJobSpecification;
 import com.JobController.job.spec.CustomDAGTaskSpecification;
@@ -24,7 +26,8 @@ public final class CustomDAGJobParser implements JobParser {
             throw new IllegalArgumentException("Custom DAG must contain at least one task");
         }
 
-        DAG dag = new DAG(customDAG.getJobId(), customDAG.getName());
+        DAG dag = new DAG(customDAG.getJobId(), customDAG.getName(),
+                customDAG.getDagTimeoutMillis());
         for (CustomDAGTaskSpecification task : customDAG.getTasks()) {
             if (task.getId() == null || task.getId().isBlank()) {
                 throw new IllegalArgumentException("Custom DAG task ID must not be null or blank");
@@ -46,8 +49,14 @@ public final class CustomDAGJobParser implements JobParser {
                     task.getId(),
                     task.getCpu(),
                     task.getMemory(),
+                    task.getDiskMb(),
+                    task.getGpuCount(),
+                    task.getGpuMemoryMbPerGpu(),
                     task.getDependencies(),
-                    task.getCommand()));
+                    task.getCommand(),
+                    new RetryPolicy(0),
+                    new TimeoutPolicy(task.getTimeoutMillis()),
+                    task.getPlacementRequirements()));
         }
 
         DAGValidator.validate(dag);

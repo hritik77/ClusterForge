@@ -110,6 +110,163 @@ public class RestApiServerTest {
         }
     }
 
+    @Test
+    public void exposesWorkerMembershipThroughDebugEndpoint() throws Exception {
+        String workerUuid = UUID.randomUUID().toString();
+        Discover.membershipManager.registerWorker(workerUuid, "1");
+        Discover.membershipManager.processHeartbeat(workerUuid, "1", 1);
+        FakeJobOperations operations = new FakeJobOperations();
+        try (RestApiServer server = new RestApiServer("127.0.0.1", 0, operations)) {
+            server.start();
+            HttpResponse<String> response = get(server.port(), "/api/workers");
+
+            assertEquals(200, response.statusCode());
+            assertTrue(response.body().contains("\"workerUUID\":\"" + workerUuid + "\""));
+            assertTrue(response.body().contains("\"state\":\"AVAILABLE\""));
+            assertTrue(response.body().contains("\"heartbeatSequence\":1"));
+            assertTrue(response.body().contains("\"incarnationId\":\"1\""));
+            assertTrue(response.body().contains("\"lastHeartbeatMillis\":"));
+        }
+    }
+
+    @Test
+    public void acceptsAndReturnsDiskAndGpuRequests() throws Exception {
+        FakeJobOperations operations = new FakeJobOperations();
+        try (RestApiServer server = new RestApiServer("127.0.0.1", 0, operations)) {
+            server.start();
+            HttpResponse<String> jobResponse = post(server.port(), "/api/jobs", """
+                    {"owner":"alice","description":"gpu job","cpuRequested":2,"memRequested":4,
+                     "diskMbRequested":2048,"gpuCountRequested":1,"gpuMemoryMbPerGpu":8192}
+                    """);
+            assertEquals(202, jobResponse.statusCode());
+            assertTrue(jobResponse.body().contains("\"diskMbRequested\":\"2048\"")
+                    || jobResponse.body().contains("\"diskMbRequested\":2048"));
+            assertTrue(jobResponse.body().contains("\"gpuCountRequested\":1"));
+            assertTrue(jobResponse.body().contains("\"gpuMemoryMbPerGpu\":\"8192\"")
+                    || jobResponse.body().contains("\"gpuMemoryMbPerGpu\":8192"));
+
+            HttpResponse<String> dagResponse = post(server.port(), """
+                    {"jobType":"CUSTOM_DAG","name":"gpu-dag","tasks":[
+                      {"id":"train","command":"python train.py","cpu":2,"memory":4,
+                       "diskMb":1024,"gpuCount":1,"gpuMemoryMbPerGpu":8192,"dependsOn":[]}
+                    ]}
+                    """);
+            assertEquals(202, dagResponse.statusCode());
+            assertTrue(dagResponse.body().contains("\"diskMb\":1024"));
+            assertTrue(dagResponse.body().contains("\"gpuCount\":1"));
+            assertTrue(dagResponse.body().contains("\"gpuMemoryMbPerGpu\":8192"));
+        }
+    }
+
+    @Test
+    public void rejectsInvalidGpuAndDiskRequests() throws Exception {
+        FakeJobOperations operations = new FakeJobOperations();
+        try (RestApiServer server = new RestApiServer("127.0.0.1", 0, operations)) {
+            server.start();
+
+            HttpResponse<String> missingGpu = post(server.port(), """
+                    {"jobType":"CUSTOM_DAG","name":"invalid-gpu","tasks":[
+                      {"id":"train","command":"run","cpu":1,"memory":1,
+                       "gpuMemoryMbPerGpu":1024}
+                    ]}
+                    """);
+            assertEquals(400, missingGpu.statusCode());
+
+            HttpResponse<String> negativeDisk = post(server.port(), """
+                    {"owner":"alice","description":"invalid disk","cpuRequested":1,
+                     "memRequested":1,"diskMbRequested":-1}
+                    """);
+            assertEquals(400, negativeDisk.statusCode());
+        }
+    }
+
+    @Test
+    public void acceptsPlacementConstraintsAndReturnsAttemptHistory() throws Exception {
+        FakeJobOperations operations = new FakeJobOperations();
+        try (RestApiServer server = new RestApiServer("127.0.0.1", 0, operations)) {
+            server.start();
+            HttpResponse<String> response = post(server.port(), """
+                    {"jobType":"CUSTOM_DAG","name":"placement-dag","tasks":[
+                      {"id":"train","command":"python train.py","cpu":2,"memory":4,
+                       "placementConstraints":[
+                         {"key":"architecture","operator":"EQUALS","value":"x86_64"},
+                         {"key":"disk","operator":"NOT_EQUALS","value":"hdd"}
+                       ]}
+                    ]}
+                    """);
+
+            assertEquals(202, response.statusCode());
+            assertTrue(response.body().contains("\"placementConstraints\""));
+            assertTrue(response.body().contains("\"operator\":\"NOT_EQUALS\""));
+            assertTrue(response.body().contains("\"currentAttempt\":0"));
+            assertTrue(response.body().contains("\"attemptNumber\":0"));
+            assertTrue(response.body().contains("\"attemptId\":"));
+        }
+    }
+
+    @Test
+    public void rejectsInvalidPlacementConstraint() throws Exception {
+        FakeJobOperations operations = new FakeJobOperations();
+        try (RestApiServer server = new RestApiServer("127.0.0.1", 0, operations)) {
+            server.start();
+            HttpResponse<String> response = post(server.port(), """
+                    {"jobType":"CUSTOM_DAG","name":"invalid-placement","tasks":[
+                      {"id":"task","command":"run","cpu":1,"memory":1,
+                       "placementConstraints":[
+                         {"key":"architecture","operator":"CONTAINS","value":"x86"}
+                       ]}
+                    ]}
+                    """);
+
+            assertEquals(400, response.statusCode());
+            assertTrue(response.body().contains("EQUALS or NOT_EQUALS"));
+        }
+    }
+
+    @Test
+    public void cancelsDagRunAndReturnsCurrentState() throws Exception {
+        FakeJobOperations operations = new FakeJobOperations();
+        try (RestApiServer server = new RestApiServer("127.0.0.1", 0, operations)) {
+            server.start();
+            HttpResponse<String> created = post(server.port(), """
+                    {"jobType":"CUSTOM_DAG","name":"cancel-me","timeoutMillis":5000,
+                     "tasks":[{"id":"A","command":"run","cpu":1,"memory":1,
+                               "timeoutMillis":1000,"dependsOn":[]}]}
+                    """);
+            assertEquals(202, created.statusCode());
+            String runId = extractRunId(created.body());
+            String dagId = extractJsonField(created.body(), "dagId");
+            assertTrue(created.body().contains("\"timeoutMillis\":5000"));
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://127.0.0.1:" + server.port()
+                            + "/api/dags/" + dagId + "/runs/" + runId))
+                    .DELETE()
+                    .build();
+            HttpResponse<String> cancelled =
+                    HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+
+            assertEquals(200, cancelled.statusCode());
+            assertTrue(cancelled.body().contains("\"state\":\"CANCELLED\""));
+            assertTrue(cancelled.body().contains("\"cancellationReason\":\"USER_REQUEST\""));
+            assertTrue(cancelled.body().contains("\"cancellationConfirmed\":true"));
+        }
+    }
+
+    @Test
+    public void rejectsInvalidTimeoutValues() throws Exception {
+        FakeJobOperations operations = new FakeJobOperations();
+        try (RestApiServer server = new RestApiServer("127.0.0.1", 0, operations)) {
+            server.start();
+            HttpResponse<String> response = post(server.port(), """
+                    {"jobType":"CUSTOM_DAG","name":"invalid-timeout","timeoutMillis":0,
+                     "tasks":[{"id":"A","command":"run","cpu":1,"memory":1,"dependsOn":[]}]}
+                    """);
+            assertEquals(400, response.statusCode());
+            assertTrue(response.body().contains("timeoutMillis"));
+        }
+    }
+
     private static HttpResponse<String> post(int port, String body) throws Exception {
         return post(port, "/api/dags", body);
     }
@@ -139,19 +296,45 @@ public class RestApiServerTest {
         return matcher.group(1);
     }
 
+    private static String extractJsonField(String body, String field) {
+        Matcher matcher = Pattern.compile("\"" + field + "\":\"([^\"]+)\"").matcher(body);
+        if (!matcher.find()) {
+            throw new AssertionError("Response did not include " + field + ": " + body);
+        }
+        return matcher.group(1);
+    }
+
     private static final class FakeJobOperations implements RestApiServer.JobOperations {
         private final AtomicLong nextJobId = new AtomicLong();
-        private final DAGManager manager = new DAGManager(job -> nextJobId.incrementAndGet());
+        private final DAGManager manager = new DAGManager(new FakeSubmissionService());
+
+        private final class FakeSubmissionService implements com.JobController.JobSubmissionService {
+            @Override
+            public long submit(Job job) {
+                return nextJobId.incrementAndGet();
+            }
+
+            @Override
+            public boolean cancel(long jobId) {
+                return true;
+            }
+        }
 
         @Override
         public Optional<Job> submitJob(
-                String owner, String description, int cpuRequested, int memRequested) {
+                String owner, String description, int cpuRequested, int memRequested,
+                long diskMbRequested, int gpuCountRequested, long gpuMemoryMbPerGpu,
+                List<com.JobController.PlacementConstraint> constraints) {
             return Optional.of(Job.newBuilder()
                     .setId(Math.toIntExact(nextJobId.incrementAndGet()))
                     .setOwner(owner)
                     .setDescription(description)
                     .setCpuRequested(cpuRequested)
                     .setMemRequested(memRequested)
+                    .setDiskMbRequested(diskMbRequested)
+                    .setGpuCountRequested(gpuCountRequested)
+                    .setGpuMemoryMbPerGpu(gpuMemoryMbPerGpu)
+                    .addAllPlacementConstraints(constraints)
                     .setState(JobState.PENDING)
                     .build());
         }
@@ -174,10 +357,10 @@ public class RestApiServerTest {
 
         @Override
         public RestApiServer.DAGSubmission submitDAG(
-                String name, List<CustomDAGTaskSpecification> tasks) {
+                String name, List<CustomDAGTaskSpecification> tasks, Long dagTimeoutMillis) {
             String dagId = "api-test-" + UUID.randomUUID();
             DAG dag = new CustomDAGJobParser().parse(
-                    new CustomDAGJobSpecification(dagId, name, tasks));
+                    new CustomDAGJobSpecification(dagId, name, tasks, dagTimeoutMillis));
             manager.registerDAG(dag);
             DAGRun run = manager.startRun(dag.getId());
             return new RestApiServer.DAGSubmission(dag, run);
@@ -187,6 +370,19 @@ public class RestApiServerTest {
         public Optional<RestApiServer.DAGSubmission> findDAGRun(String runId) {
             return manager.findRun(runId).flatMap(run -> manager.findDAG(run.getDagId())
                     .map(dag -> new RestApiServer.DAGSubmission(dag, run)));
+        }
+
+        @Override
+        public Optional<RestApiServer.DAGCancellation> cancelDAGRun(String dagId, String runId) {
+            Optional<DAGRun> run = manager.findRun(runId);
+            if (run.isEmpty() || !run.get().getDagId().equals(dagId)) {
+                return Optional.empty();
+            }
+            boolean confirmed = run.get().getState() != com.JobController.dag.DAGRunState.RUNNING
+                    || manager.cancelRun(runId);
+            return manager.findDAG(dagId)
+                    .map(dag -> new RestApiServer.DAGCancellation(
+                            new RestApiServer.DAGSubmission(dag, run.get()), confirmed));
         }
     }
 }

@@ -25,11 +25,9 @@ public final class BatchJobParser implements JobParser {
         for (int index = 1; index <= batch.getCount(); index++) {
             String taskId = "%s-%03d".formatted(batch.getName(), index);
             dag.addTask(new DAGTask(
-                    taskId,
-                    batch.getCpu(),
-                    batch.getMemory(),
-                    Set.of(),
-                    batch.getCommand()));
+                    taskId, batch.getCpu(), batch.getMemory(),
+                    batch.getDiskMb(), batch.getGpuCount(), batch.getGpuMemoryMbPerGpu(),
+                    Set.of(), batch.getCommand()));
         }
         return dag;
     }

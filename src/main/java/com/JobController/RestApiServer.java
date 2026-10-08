@@ -12,13 +12,18 @@ import com.sun.net.httpserver.HttpServer;
 import com.JobController.dag.DAG;
 import com.JobController.dag.DAGGraphPrinter;
 import com.JobController.dag.DAGRun;
+import com.JobController.dag.TaskAttemptSnapshot;
 import com.JobController.job.spec.CustomDAGTaskSpecification;
+import com.JobController.scheduling.PlacementConstraint;
+import com.JobController.scheduling.PlacementOperator;
+import com.JobController.scheduling.PlacementRequirements;
 
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -45,13 +50,20 @@ final class RestApiServer implements AutoCloseable {
 
     record DAGSubmission(DAG dag, DAGRun run) {}
 
+    record DAGCancellation(DAGSubmission submission, boolean cancellationConfirmed) {}
+
     interface JobOperations {
-        Optional<Job> submitJob(String owner, String description, int cpuRequested, int memRequested);
+        Optional<Job> submitJob(String owner, String description, int cpuRequested, int memRequested,
+                                long diskMbRequested, int gpuCountRequested,
+                                long gpuMemoryMbPerGpu,
+                                List<com.JobController.PlacementConstraint> constraints);
         List<Job> listJobs();
         Optional<Job> findJob(int id);
         CancellationResult cancelJob(int id);
-        DAGSubmission submitDAG(String name, List<CustomDAGTaskSpecification> tasks);
+        DAGSubmission submitDAG(
+                String name, List<CustomDAGTaskSpecification> tasks, Long dagTimeoutMillis);
         Optional<DAGSubmission> findDAGRun(String runId);
+        Optional<DAGCancellation> cancelDAGRun(String dagId, String runId);
     }
 
     private final HttpServer server;
@@ -63,6 +75,7 @@ final class RestApiServer implements AutoCloseable {
                 new InetSocketAddress(InetAddress.getByName(host), port), 0);
         server.createContext("/api/jobs", exchange -> handleJobs(exchange, jobs));
         server.createContext("/api/dags", exchange -> handleDags(exchange, jobs));
+        server.createContext("/api/workers", exchange -> handleWorkers(exchange));
         server.setExecutor(executor);
     }
 
@@ -136,7 +149,66 @@ final class RestApiServer implements AutoCloseable {
                 getDAGRun(exchange, jobs, runId);
                 return;
             }
+
+            String[] segments=path.split("/", -1);
+            if (segments.length==6 && segments[1].equals("api")
+                    && segments[2].equals("dags") && segments[4].equals("runs")
+                    && !segments[3].isBlank() && !segments[5].isBlank()) {
+                if (!exchange.getRequestMethod().equals("DELETE")) {
+                    methodNotAllowed(exchange, "DELETE");
+                    return;
+                }
+                cancelDAGRun(exchange, jobs, segments[3], segments[5]);
+                return;
+            }
             sendError(exchange, 404, "Route not found");
+        } finally {
+            exchange.close();
+        }
+    }
+
+    private static void handleWorkers(HttpExchange exchange) throws IOException {
+        try {
+            if (!exchange.getRequestMethod().equals("GET")) {
+                methodNotAllowed(exchange, "GET");
+                return;
+            }
+            ListValue.Builder listBuilder = ListValue.newBuilder();
+            for (com.JobController.worker.WorkerMembership m
+                    : Discover.membershipManager.getWorkers().stream()
+                            .sorted(Comparator.comparing(
+                                    com.JobController.worker.WorkerMembership::workerUUID))
+                            .toList()) {
+                Struct.Builder workerStruct = Struct.newBuilder()
+                        .putFields("workerUUID", Value.newBuilder().setStringValue(m.workerUUID()).build())
+                        .putFields("state", Value.newBuilder().setStringValue(m.state().name()).build())
+                        .putFields("registeredAtMillis", Value.newBuilder().setNumberValue(m.registeredAtMillis()).build())
+                        .putFields("lastHeartbeatMillis", Value.newBuilder().setNumberValue(m.lastHeartbeatMillis()).build())
+                        .putFields("lastStateChangeMillis", Value.newBuilder().setNumberValue(m.lastStateChangeMillis()).build())
+                        .putFields("suspectedAtMillis", Value.newBuilder().setNumberValue(m.suspectedAtMillis()).build())
+                        .putFields("downAtMillis", Value.newBuilder().setNumberValue(m.downAtMillis()).build())
+                        .putFields("timeToSuspectMillis",
+                                Value.newBuilder().setNumberValue(m.lastSuspectLatencyMillis()).build())
+                        .putFields("timeToDownMillis",
+                                Value.newBuilder().setNumberValue(m.lastDownLatencyMillis()).build())
+                        .putFields("missedHeartbeatCount", Value.newBuilder().setNumberValue(m.missedHeartbeatCount()).build());
+
+                com.JobController.worker.WorkerSession session = m.currentSession();
+                if (session != null) {
+                    workerStruct.putFields("incarnationId", Value.newBuilder().setStringValue(session.incarnationId()).build());
+                    workerStruct.putFields("heartbeatSequence",
+                            Value.newBuilder().setNumberValue(session.latestSequence()).build());
+                    workerStruct.putFields("latestSequence",
+                            Value.newBuilder().setNumberValue(session.latestSequence()).build());
+                }
+
+                listBuilder.addValues(Value.newBuilder().setStructValue(workerStruct.build()).build());
+            }
+            String json = JSON_PRINTER.print(listBuilder.build());
+            byte[] responseBytes = json.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, responseBytes.length);
+            exchange.getResponseBody().write(responseBytes);
         } finally {
             exchange.close();
         }
@@ -178,13 +250,20 @@ final class RestApiServer implements AutoCloseable {
             sendError(exchange, 400, "owner and description are required");
             return;
         }
-        if (input.getCpuRequested()<=0 || input.getMemRequested()<=0) {
-            sendError(exchange, 400, "cpuRequested and memRequested must be positive");
+        if (input.getCpuRequested()<=0 || input.getMemRequested()<=0
+                || input.getDiskMbRequested() < 0 || input.getGpuCountRequested() < 0
+                || input.getGpuMemoryMbPerGpu() < 0
+                || input.getGpuCountRequested() == 0 && input.getGpuMemoryMbPerGpu() != 0) {
+            sendError(exchange, 400,
+                    "CPU/memory must be positive; disk/GPU requests must be non-negative, "
+                            + "and GPU memory requires a GPU");
             return;
         }
 
         Optional<Job> submitted=jobs.submitJob(input.getOwner(), input.getDescription(),
-                input.getCpuRequested(), input.getMemRequested());
+                input.getCpuRequested(), input.getMemRequested(), input.getDiskMbRequested(),
+                input.getGpuCountRequested(), input.getGpuMemoryMbPerGpu(),
+                input.getPlacementConstraintsList());
         if (submitted.isEmpty()) {
             sendError(exchange, 503, "Job queue is full; the job was not accepted");
             return;
@@ -217,7 +296,9 @@ final class RestApiServer implements AutoCloseable {
                 throw new IllegalArgumentException("jobType must be CUSTOM_DAG");
             }
             String name=stringField(input, "name");
-            DAGSubmission submission=jobs.submitDAG(name, parseDAGTasks(input));
+            Long dagTimeoutMillis=optionalLongField(input, "timeoutMillis");
+            DAGSubmission submission=jobs.submitDAG(
+                    name, parseDAGTasks(input), dagTimeoutMillis);
             exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
             exchange.getResponseHeaders().set(
                     "Location", "/api/dags/runs/" + submission.run().getRunId());
@@ -245,10 +326,46 @@ final class RestApiServer implements AutoCloseable {
             String command=stringField(task, "command");
             int cpu=intField(task, "cpu");
             int memory=intField(task, "memory");
+            long diskMb=optionalNonNegativeLongField(task, "diskMb");
+            int gpuCount=optionalNonNegativeIntField(task, "gpuCount");
+            long gpuMemoryMbPerGpu=optionalNonNegativeLongField(task, "gpuMemoryMbPerGpu");
             Set<String> dependencies=stringArrayField(task, "dependsOn");
-            tasks.add(new CustomDAGTaskSpecification(id, command, cpu, memory, dependencies));
+            Long timeoutMillis=optionalLongField(task, "timeoutMillis");
+            tasks.add(new CustomDAGTaskSpecification(
+                    id, command, cpu, memory, diskMb, gpuCount, gpuMemoryMbPerGpu,
+                    dependencies, timeoutMillis, parsePlacementRequirements(task)));
         }
         return List.copyOf(tasks);
+    }
+
+    private static PlacementRequirements parsePlacementRequirements(Struct task) {
+        Value value = task.getFieldsMap().get("placementConstraints");
+        if (value == null) {
+            return PlacementRequirements.none();
+        }
+        if (value.getKindCase() != Value.KindCase.LIST_VALUE) {
+            throw new IllegalArgumentException("placementConstraints must be an array");
+        }
+        List<PlacementConstraint> constraints = new ArrayList<>();
+        for (Value item : value.getListValue().getValuesList()) {
+            if (item.getKindCase() != Value.KindCase.STRUCT_VALUE) {
+                throw new IllegalArgumentException(
+                        "Each placement constraint must be an object");
+            }
+            Struct constraint = item.getStructValue();
+            String key = stringField(constraint, "key");
+            String operatorValue = stringField(constraint, "operator");
+            String requiredValue = stringField(constraint, "value");
+            PlacementOperator operator;
+            try {
+                operator = PlacementOperator.valueOf(operatorValue.toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(
+                        "Placement operator must be EQUALS or NOT_EQUALS", e);
+            }
+            constraints.add(new PlacementConstraint(key, operator, requiredValue));
+        }
+        return new PlacementRequirements(constraints);
     }
 
     private static String stringField(Struct object, String field) {
@@ -274,6 +391,46 @@ final class RestApiServer implements AutoCloseable {
             throw new IllegalArgumentException(field + " must be a positive integer");
         }
         return (int) number;
+    }
+
+    private static Long optionalLongField(Struct object, String field) {
+        Value value=object.getFieldsMap().get(field);
+        if (value == null || value.getKindCase() == Value.KindCase.NULL_VALUE) {
+            return null;
+        }
+        if (value.getKindCase() != Value.KindCase.NUMBER_VALUE) {
+            throw new IllegalArgumentException(field + " must be a positive integer");
+        }
+        double number=value.getNumberValue();
+        if (!Double.isFinite(number) || number < 1 || number >= 0x1.0p63
+                || number != Math.rint(number)) {
+            throw new IllegalArgumentException(field + " must be a positive integer");
+        }
+        return (long) number;
+    }
+
+    private static int optionalNonNegativeIntField(Struct object, String field) {
+        long value=optionalNonNegativeLongField(object, field);
+        if (value > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(field + " must fit a non-negative integer");
+        }
+        return (int) value;
+    }
+
+    private static long optionalNonNegativeLongField(Struct object, String field) {
+        Value value=object.getFieldsMap().get(field);
+        if (value == null || value.getKindCase() == Value.KindCase.NULL_VALUE) {
+            return 0;
+        }
+        if (value.getKindCase() != Value.KindCase.NUMBER_VALUE) {
+            throw new IllegalArgumentException(field + " must be a non-negative integer");
+        }
+        double number=value.getNumberValue();
+        if (!Double.isFinite(number) || number < 0 || number >= 0x1.0p63
+                || number != Math.rint(number)) {
+            throw new IllegalArgumentException(field + " must be a non-negative integer");
+        }
+        return (long) number;
     }
 
     private static Set<String> stringArrayField(Struct object, String field) {
@@ -305,14 +462,45 @@ final class RestApiServer implements AutoCloseable {
         send(exchange, 200, jsonDAGSubmission(submission.get()));
     }
 
+    private static void cancelDAGRun(
+            HttpExchange exchange, JobOperations jobs, String dagId, String runId)
+            throws IOException {
+        Optional<DAGCancellation> cancellation=jobs.cancelDAGRun(dagId, runId);
+        if (cancellation.isEmpty()) {
+            sendError(exchange, 404, "DAG run not found for DAG " + dagId);
+            return;
+        }
+        if (!cancellation.get().cancellationConfirmed()) {
+            sendError(exchange, 503, "DAG cancellation could not be confirmed");
+            return;
+        }
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        send(exchange, 200, jsonDAGSubmission(cancellation.get().submission()));
+    }
+
     private static String jsonDAGSubmission(DAGSubmission submission) {
         Struct.Builder response=Struct.newBuilder()
                 .putFields("dagId", stringValue(submission.dag().getId()))
                 .putFields("name", stringValue(submission.dag().getName()))
                 .putFields("runId", stringValue(submission.run().getRunId()))
                 .putFields("state", stringValue(submission.run().getState().name()))
+                .putFields("startTimeMillis", numberValue(submission.run().getStartTimeMillis()))
                 .putFields("graph", stringValue(
                         DAGGraphPrinter.renderRun(submission.dag(), submission.run())));
+        putOptionalNumber(response, "timeoutMillis", submission.dag().getDagTimeoutMillis());
+        putOptionalNumber(response, "deadlineMillis", submission.run().getDeadlineMillis());
+        if (submission.run().getTimeoutReason() != null) {
+            response.putFields("timeoutReason",
+                    stringValue(submission.run().getTimeoutReason().name()));
+        }
+        if (submission.run().getCancellationReason() != null) {
+            response.putFields("cancellationReason",
+                    stringValue(submission.run().getCancellationReason().name()));
+        }
+        if (submission.run().getCancellationConfirmed() != null) {
+            response.putFields("cancellationConfirmed",
+                    booleanValue(submission.run().getCancellationConfirmed()));
+        }
         ListValue.Builder tasks=ListValue.newBuilder();
         for (String taskId : submission.dag().getTasks().keySet()) {
             var dagTask=submission.dag().getTask(taskId);
@@ -321,8 +509,73 @@ final class RestApiServer implements AutoCloseable {
                     .putFields("command", stringValue(dagTask.getCommand()))
                     .putFields("cpu", numberValue(dagTask.getCpuRequested()))
                     .putFields("memory", numberValue(dagTask.getMemRequested()))
+                    .putFields("diskMb", numberValue(dagTask.getDiskMbRequested()))
+                    .putFields("gpuCount", numberValue(dagTask.getGpuCountRequested()))
+                    .putFields("gpuMemoryMbPerGpu",
+                            numberValue(dagTask.getGpuMemoryMbPerGpu()))
                     .putFields("state", stringValue(
                             submission.run().getTaskState(taskId).name()));
+            ListValue.Builder placementConstraints = ListValue.newBuilder();
+            for (PlacementConstraint constraint
+                    : dagTask.getPlacementRequirements().getConstraints()) {
+                placementConstraints.addValues(Value.newBuilder().setStructValue(
+                        Struct.newBuilder()
+                                .putFields("key", stringValue(constraint.getKey()))
+                                .putFields("operator",
+                                        stringValue(constraint.getOperator().name()))
+                                .putFields("value", stringValue(constraint.getValue()))
+                ).build());
+            }
+            task.putFields("placementConstraints",
+                    Value.newBuilder().setListValue(placementConstraints).build());
+            List<TaskAttemptSnapshot> attempts = submission.run().getAttempts(taskId);
+            ListValue.Builder attemptValues = ListValue.newBuilder();
+            for (TaskAttemptSnapshot attempt : attempts) {
+                Struct.Builder attemptJson = Struct.newBuilder()
+                        .putFields("attemptId", stringValue(attempt.getAttemptId()))
+                        .putFields("attemptNumber", numberValue(attempt.getAttemptNumber()))
+                        .putFields("state", stringValue(attempt.getState().name()));
+                putOptionalNumber(attemptJson, "jobId", attempt.getJobId());
+                putOptionalString(attemptJson, "workerId", attempt.getWorkerId());
+                putOptionalNumber(attemptJson, "createdAtMillis", attempt.getCreatedAtMillis());
+                putOptionalNumber(attemptJson, "startedAtMillis", attempt.getStartedAtMillis());
+                putOptionalNumber(attemptJson, "finishedAtMillis", attempt.getFinishedAtMillis());
+                if (attempt.getFailureReason() != null) {
+                    attemptJson.putFields(
+                            "failureReason", stringValue(attempt.getFailureReason().name()));
+                }
+                if (attempt.getFailureMessage() != null) {
+                    attemptJson.putFields(
+                            "failureMessage", stringValue(attempt.getFailureMessage()));
+                }
+                Struct.Builder labels = Struct.newBuilder();
+                attempt.getWorkerLabels().forEach((key, label) ->
+                        labels.putFields(key, stringValue(label)));
+                attemptJson.putFields("workerLabels",
+                        Value.newBuilder().setStructValue(labels).build());
+                attemptValues.addValues(
+                        Value.newBuilder().setStructValue(attemptJson).build());
+            }
+            task.putFields("attempts",
+                    Value.newBuilder().setListValue(attemptValues).build());
+            putOptionalNumber(task, "currentAttempt",
+                    attempts.isEmpty() ? null
+                            : (long) attempts.get(attempts.size() - 1).getAttemptNumber());
+            putOptionalNumber(task, "timeoutMillis",
+                    dagTask.getTimeoutPolicy().getTaskTimeoutMillis());
+            putOptionalNumber(task, "startedAtMillis",
+                    submission.run().getTaskStartTime(taskId));
+            var failure=submission.run().getTaskFailure(taskId);
+            if (failure != null) {
+                task.putFields("failureReason", stringValue(failure.getReason().name()));
+                if (failure.getTimeoutReason() != null) {
+                    task.putFields("timeoutReason",
+                            stringValue(failure.getTimeoutReason().name()));
+                }
+                if (failure.getMessage() != null) {
+                    task.putFields("failureMessage", stringValue(failure.getMessage()));
+                }
+            }
             Long jobId=submission.run().getJobId(taskId);
             task.putFields("jobId", jobId == null
                     ? Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build()
@@ -348,6 +601,22 @@ final class RestApiServer implements AutoCloseable {
 
     private static Value numberValue(long value) {
         return Value.newBuilder().setNumberValue(value).build();
+    }
+
+    private static Value booleanValue(boolean value) {
+        return Value.newBuilder().setBoolValue(value).build();
+    }
+
+    private static void putOptionalNumber(Struct.Builder object, String field, Long value) {
+        object.putFields(field, value == null
+                ? Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build()
+                : numberValue(value));
+    }
+
+    private static void putOptionalString(Struct.Builder object, String field, String value) {
+        object.putFields(field, value == null
+                ? Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build()
+                : stringValue(value));
     }
 
     private static byte[] readRequestBody(HttpExchange exchange) throws IOException {

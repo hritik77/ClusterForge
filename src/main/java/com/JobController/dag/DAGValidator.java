@@ -54,6 +54,15 @@ public final class DAGValidator {
                 throw new IllegalArgumentException(
                         "Task '" + taskId + "' must request positive memory");
             }
+            if (task.getDiskMbRequested() < 0 || task.getGpuCountRequested() < 0
+                    || task.getGpuMemoryMbPerGpu() < 0) {
+                throw new IllegalArgumentException(
+                        "Task '" + taskId + "' has a negative resource request");
+            }
+            if (task.getGpuCountRequested() == 0 && task.getGpuMemoryMbPerGpu() != 0) {
+                throw new IllegalArgumentException(
+                        "Task '" + taskId + "' requests GPU memory without requesting a GPU");
+            }
 
             Set<String> dependencies = task.getDependencies();
             if (dependencies == null) {

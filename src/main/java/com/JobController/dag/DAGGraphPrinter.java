@@ -12,14 +12,12 @@ public final class DAGGraphPrinter {
         Objects.requireNonNull(job, "Job must not be null");
         return """
                 Job DAG (standalone submission)
-                  [%s] Job #%d: %s (CPU=%d, memory=%d)
+                  [%s] Job #%d: %s (CPU=%d, memory=%d%s)
                     -> (no dependencies or dependents)
-                """.formatted(
-                job.getState(),
-                job.getId(),
-                singleLine(job.getDescription()),
-                job.getCpuRequested(),
-                job.getMemRequested()).stripTrailing();
+                """.formatted(job.getState(), job.getId(), singleLine(job.getDescription()),
+                job.getCpuRequested(), job.getMemRequested(), extraResources(
+                        job.getDiskMbRequested(), job.getGpuCountRequested(),
+                        job.getGpuMemoryMbPerGpu())).stripTrailing();
     }
 
     public static String renderRun(DAG dag, DAGRun run) {
@@ -41,7 +39,16 @@ public final class DAGGraphPrinter {
             Long jobId = run.getJobId(taskId);
             graph.append(System.lineSeparator())
                     .append("  [").append(run.getTaskState(taskId)).append("] ")
-                    .append(singleLine(taskId));
+            .append(singleLine(taskId));
+            var task = dag.getTask(taskId);
+            String extraResources = extraResources(
+            task.getDiskMbRequested(), task.getGpuCountRequested(),
+            task.getGpuMemoryMbPerGpu());
+            if (!extraResources.isEmpty()) {
+                graph.append(" (CPU=").append(task.getCpuRequested())
+                .append(", memory=").append(task.getMemRequested())
+                .append(extraResources).append(')');
+            }
             if (jobId != null) {
                 graph.append(" (job #").append(jobId).append(')');
             }
@@ -64,5 +71,17 @@ public final class DAGGraphPrinter {
 
     private static String singleLine(String value) {
         return value.replaceAll("[\\p{Cntrl}]", " ");
+    }
+
+    private static String extraResources(long diskMb, int gpuCount, long gpuMemoryMbPerGpu) {
+        StringBuilder resources = new StringBuilder();
+        if (diskMb > 0) {
+            resources.append(", disk=").append(diskMb).append(" MB");
+        }
+        if (gpuCount > 0) {
+            resources.append(", GPUs=").append(gpuCount)
+                    .append(", GPU memory/GPU=").append(gpuMemoryMbPerGpu).append(" MB");
+        }
+        return resources.toString();
     }
 }

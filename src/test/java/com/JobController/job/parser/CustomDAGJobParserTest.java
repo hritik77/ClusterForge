@@ -122,6 +122,18 @@ public class CustomDAGJobParserTest {
     }
 
     @Test
+    public void propagatesDiskGpuCountAndPerGpuMemory() {
+        CustomDAGTaskSpecification specification = new CustomDAGTaskSpecification(
+                "train", "python train.py", 8, 16, 2_048, 2, 12_288, Set.of());
+
+        DAGTask task = parser.parse(specification(specification)).getTask("train");
+
+        assertEquals(2_048, task.getDiskMbRequested());
+        assertEquals(2, task.getGpuCountRequested());
+        assertEquals(12_288, task.getGpuMemoryMbPerGpu());
+    }
+
+    @Test
     public void preservesDependencyOrderAndMakesSpecificationCollectionsImmutable() {
         Set<String> dependencies = new LinkedHashSet<>(List.of("B", "A"));
         CustomDAGTaskSpecification dependent =

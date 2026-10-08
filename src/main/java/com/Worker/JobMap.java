@@ -5,17 +5,11 @@ import com.JobController.JobState;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 public class JobMap {
 
     static final ConcurrentMap<Integer, ManagedJob> jobs =
             new ConcurrentHashMap<>();
-
-    static final ScheduledExecutorService cancellationExecutor =
-            Executors.newSingleThreadScheduledExecutor();
 
     static final class ManagedJob {
         private Job job;
@@ -29,10 +23,12 @@ public class JobMap {
             return job;
         }
 
-        synchronized void setState(JobState state) {
+        synchronized boolean setState(JobState state) {
             if (!isTerminal(job.getState())) {
                 job=job.toBuilder().setState(state).build();
+                return true;
             }
+            return false;
         }
 
         synchronized Process process() {

@@ -31,6 +31,9 @@ public final class MapReduceJobParser implements JobParser {
                     mapTaskId,
                     mapReduce.getMapCpu(),
                     mapReduce.getMapMemory(),
+                    mapReduce.getMapDiskMb(),
+                    mapReduce.getMapGpuCount(),
+                    mapReduce.getMapGpuMemoryMbPerGpu(),
                     Set.of(),
                     mapReduce.getMapperCommand()));
         }
@@ -39,6 +42,9 @@ public final class MapReduceJobParser implements JobParser {
                 "reduce",
                 mapReduce.getReduceCpu(),
                 mapReduce.getReduceMemory(),
+                mapReduce.getReduceDiskMb(),
+                mapReduce.getReduceGpuCount(),
+                mapReduce.getReduceGpuMemoryMbPerGpu(),
                 mapTaskIds,
                 mapReduce.getReducerCommand()));
         return dag;

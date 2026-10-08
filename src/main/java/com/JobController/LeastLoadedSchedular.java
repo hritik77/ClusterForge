@@ -23,6 +23,27 @@ final class LeastLoadedSchedular implements Scheduler {
         double memRatio=totalMem<=0 ? 0.0 : (double) usedMem / totalMem;
         double demandCpuRatio=job.getCpuRequested()<=0 ? 0.0 : (double) job.getCpuRequested() / totalCpu;
         double demandMemRatio=job.getMemRequested()<=0 ? 0.0 : (double) job.getMemRequested() / totalMem;
-        return cpuRatio + memRatio + demandCpuRatio + demandMemRatio;
+        long totalDisk=candidate.tally().totalDiskMb();
+        long totalGpuMemory=candidate.tally().totalGpuMemoryMb();
+        double diskRatio=totalDisk<=0 ? 0.0
+                : (double) (totalDisk-candidate.tally().availableDiskMb()) / totalDisk;
+        double gpuRatio=candidate.tally().totalGpuCount()<=0 ? 0.0
+                : (double) (candidate.tally().totalGpuCount()
+                        - candidate.tally().availableGpuCount())
+                        / candidate.tally().totalGpuCount();
+        double gpuMemoryRatio=totalGpuMemory<=0 ? 0.0
+                : (double) (totalGpuMemory-candidate.tally().availableGpuMemoryMb())
+                        / totalGpuMemory;
+        double demandDiskRatio=job.getDiskMbRequested()<=0 || totalDisk<=0 ? 0.0
+                : (double) job.getDiskMbRequested() / totalDisk;
+        double demandGpuRatio=job.getGpuCountRequested()<=0
+                || candidate.tally().totalGpuCount()<=0 ? 0.0
+                : (double) job.getGpuCountRequested() / candidate.tally().totalGpuCount();
+        double demandGpuMemoryRatio=job.getGpuCountRequested()<=0 || totalGpuMemory<=0 ? 0.0
+                : ((double) job.getGpuMemoryMbPerGpu() * job.getGpuCountRequested())
+                        / totalGpuMemory;
+        return cpuRatio + memRatio + diskRatio + gpuRatio + gpuMemoryRatio
+                + demandCpuRatio + demandMemRatio + demandDiskRatio
+                + demandGpuRatio + demandGpuMemoryRatio;
     }
 }

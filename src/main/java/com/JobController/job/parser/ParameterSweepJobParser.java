@@ -35,7 +35,8 @@ public final class ParameterSweepJobParser implements JobParser {
             String taskId = "experiment-%03d".formatted(index + 1);
             String generatedCommand = generateCommand(sweep.getCommand(), parameterNames, combination);
             dag.addTask(new DAGTask(
-                    taskId, sweep.getCpu(), sweep.getMemory(), Set.of(), generatedCommand));
+                    taskId, sweep.getCpu(), sweep.getMemory(), sweep.getDiskMb(),
+                    sweep.getGpuCount(), sweep.getGpuMemoryMbPerGpu(), Set.of(), generatedCommand));
         }
         return dag;
     }

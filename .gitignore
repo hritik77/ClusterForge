@@ -10,6 +10,8 @@ target/
 
 # Log files
 *.log
+.worker_uuid
+.worker_uuid.incarnation
 
 # BlueJ files
 *.ctxt
